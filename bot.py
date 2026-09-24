@@ -224,48 +224,55 @@ async def manual_rebalance_command(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         await update.message.reply_text(f"خطا در ریبالانس: {e}")
 
-# تابع بازبینی خودکار متصل به JobQueue استاندارد تلگرام
-async def check_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        state = load_state()
-        now = int(time.time())
-        elapsed = now - state.get("last_rebalance_ts", 0)
 
-        # اجرای خودکار پس از ۲۴۰ ساعت
-        if elapsed >= (LOOKBACK_HOURS * 3600):
-            logger.info("سررسید ۲۴۰ ساعت فرا رسید. شروع ریبالانس خودکار...")
-            scores, prices = compute_hybrid_scores()
-            targets, logs, _ = execute_rebalance(state, scores, prices)
-            msg = format_status_message(state, scores, prices, targets=targets, logs=logs)
-            
-            chat_id = TELEGRAM_CHAT_ID or (context.job.chat_id if context.job else None)
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚨 **اجرای سررسید دوره ۱۰ روزه (ریبالانس خودکار)**\n\n{msg}",
-                    parse_mode='Markdown'
-                )
-    except Exception as e:
-        logger.error(f"خطا در جاب دوره‌ای: {e}")
+# تسک پس‌زمینه خودکار برای بررسی دوره ۱۰ روزه
+async def background_scheduler(app):
+    while True:
+        try:
+            state = load_state()
+            now = int(time.time())
+            last_ts = state.get("last_rebalance_ts", 0)
+            elapsed = now - last_ts
+
+            # اگر ۲۴۰ ساعت (۱۰ روز) گذشت یا اولین بار است
+            if last_ts == 0 or elapsed >= (LOOKBACK_HOURS * 3600):
+                logger.info("سررسید دوره ۱۰ روزه فرا رسید. در حال ریبالانس خودکار...")
+                scores, prices = compute_hybrid_scores()
+                targets, logs, _ = execute_rebalance(state, scores, prices)
+                msg = format_status_message(state, scores, prices, targets=targets, logs=logs)
+
+                if TELEGRAM_CHAT_ID:
+                    await app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=f"🚨 **اجرای سررسید دوره ۱۰ روزه (ریبالانس خودکار)**\n\n{msg}",
+                        parse_mode='Markdown'
+                    )
+        except Exception as e:
+            logger.error(f"خطا در بررسی دوره‌ای: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+async def post_init(application):
+    asyncio.create_task(background_scheduler(application))
+    logger.info("تسک پس‌زمینه بررسی ۱۰ روزه با موفقیت فعال شد.")
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("متغیر TELEGRAM_BOT_TOKEN تعریف نشده است.")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("rebalance", manual_rebalance_command))
 
-    # زمان‌بندی بررسی دوره‌ای هر ۱ ساعت با جاب‌کیوی استاندارد ربات
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(check_scheduler_job, interval=CHECK_INTERVAL_SECONDS, first=10)
-        logger.info("JobQueue با موفقیت زمان‌بندی شد.")
-
-    logger.info("ربات با موفقیت استارت خورد.")
-    app.run_polling()
+    logger.info("ربات آماده دریافت دستورات است.")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
