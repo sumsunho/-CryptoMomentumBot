@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -23,11 +24,13 @@ os.environ.setdefault("STATE_FILE", str(PROJECT_ROOT / "tests" / "tmp_test_state
 
 import bot  # noqa: E402  (بعد از تنظیم متغیرهای محیطی)
 
+from telegram import Chat, Message, MessageEntity, Update, User  # noqa: E402
+from telegram.ext import CommandHandler  # noqa: E402
+
 
 # ─────────────────────────── Fixtures ───────────────────────────
 @pytest.fixture
 def tmp_state_file(tmp_path):
-    """یک مسیر فایل وضعیت موقت در دایرکتوری tmp_path."""
     return str(tmp_path / "state.json")
 
 
@@ -42,15 +45,13 @@ def reset_storage_singleton():
         os.environ["STATE_FILE"] = old_state_file
 
 
-def _make_closed_klines(closes, last_open_close=None, base_ts_ms=None):
+def _make_closed_klines(closes, last_open_close=None):
     """ساخت لیست کندل‌های Binance با فرمت واقعی.
 
     هر کندل: [openTime, open, high, low, close, volume, closeTime, ...]
     closeTime = k[6]؛ اگر < now_ms باشد یعنی کندل بسته‌شده است.
     کندل آخر را با closeTime > now_ms می‌سازیم تا «باز» تلقی شود.
     """
-    if base_ts_ms is None:
-        base_ts_ms = 1_700_000_000_000
     klines = []
     now_ms = int(time.time() * 1000)
     n = len(closes)
@@ -58,16 +59,19 @@ def _make_closed_klines(closes, last_open_close=None, base_ts_ms=None):
         # همه‌ی کندل‌های واقعی قبل از now بسته شوند
         open_time = now_ms - (n - i) * 3600_000 - 3600_000
         close_time = open_time + 3600_000 - 1
-        # مطمئن می‌شویم closeTime قبل از now_ms باشد
         if close_time >= now_ms:
             close_time = now_ms - (n - i) * 3600_000 - 1
             open_time = close_time - 3600_000 + 1
-        klines.append([open_time, str(c), str(c), str(c), str(c), "1.0", close_time, "1.0", 0, "0", "0", "0"])
+        klines.append(
+            [open_time, str(c), str(c), str(c), str(c), "1.0", close_time, "1.0", 0, "0", "0", "0"]
+        )
     # کندل آخر (باز): closeTime در آینده
     last_close = last_open_close if last_open_close is not None else closes[-1]
     open_time = now_ms + 1000
     close_time = now_ms + 3_600_000  # در آینده
-    klines.append([open_time, str(last_close), str(last_close), str(last_close), str(last_close), "1.0", close_time, "1.0", 0, "0", "0", "0"])
+    klines.append(
+        [open_time, str(last_close), str(last_close), str(last_close), str(last_close), "1.0", close_time, "1.0", 0, "0", "0", "0"]
+    )
     return klines
 
 
@@ -81,6 +85,30 @@ def _make_response(klines, status_code=200):
     else:
         resp.raise_for_status.side_effect = Exception(f"HTTP {status_code}")
     return resp
+
+
+def _make_command_update(chat_id, command="start"):
+    """ساخت یک Update واقعی تلگرام برای تست CommandHandler.check_update.
+
+    شامل یک Message با متن `/command` و یک MessageEntity از نوع BOT_COMMAND.
+    یک bot mock شده به message متصل می‌شود تا PTB v22 بتواند get_bot() را صدا بزند.
+    """
+    chat = Chat(id=chat_id, type=Chat.PRIVATE)
+    user = User(id=chat_id, first_name="Test", is_bot=False)
+    text = f"/{command}"
+    msg = Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=user,
+        text=text,
+        entities=[
+            MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text))
+        ],
+    )
+    # PTB v22 نیاز دارد که message به یک bot متصل باشد (در check_update → get_bot)
+    msg.set_bot(MagicMock())
+    return Update(update_id=1, message=msg)
 
 
 # ─────────────────────────── تست‌های امتیاز ───────────────────────────
@@ -145,13 +173,82 @@ class TestComputeScores:
                 bot.fetch_pair_data("ETHBTC")
 
 
+# ─────────────────────────── تست‌های انتخاب هدف ───────────────────────────
+class TestSelectTargets:
+    def _make_scores(self, eligible_pairs, scores_by_pair=None):
+        """ساخت scores برای تست.
+
+        eligible_pairs: لیست جفت‌ارزهایی که eligible هستند.
+        scores_by_pair: dict اختیاری برای مقداردهی score دستی.
+        """
+        scores = {}
+        for i, p in enumerate(bot.PAIRS):
+            eligible = p in eligible_pairs
+            default_score = float(len(bot.PAIRS) - i) if eligible else -float(len(bot.PAIRS) - i)
+            scores[p] = {
+                "score": float(scores_by_pair[p]) if scores_by_pair and p in scores_by_pair else default_score,
+                "return_10d": 5.0 if eligible else -5.0,
+                "trend_score": 0.1 if eligible else -0.1,
+                "eligible": eligible,
+                "price": 0.001,
+            }
+        return scores
+
+    def test_selects_top_n_eligible(self):
+        """از بین eligibleها، TOP_N با بالاترین امتیاز انتخاب شوند."""
+        scores = self._make_scores(
+            eligible_pairs=["ETHBTC", "BNBBTC", "SOLBTC"],
+            scores_by_pair={"ETHBTC": 3.0, "BNBBTC": 2.0, "SOLBTC": 1.0},
+        )
+        targets = bot.select_targets(scores)
+        assert len(targets) == bot.TOP_N
+        assert "ETHBTC" in targets
+        assert "BNBBTC" in targets
+
+    def test_skips_ineligible_even_with_high_score(self):
+        """اگر جفت‌ارز ineligible در TOP_N اول باشد، انتخاب نمی‌شود (خروجی کم می‌شود).
+
+        منطق اصلی: فقط بین TOP_N رتبه‌ی اول eligible را فیلتر می‌کند. پس اگر
+        TOP_N اول ineligible باشند، خروجی خالی می‌شود.
+        """
+        scores = self._make_scores(
+            eligible_pairs=["SOLBTC", "XRPBTC"],
+            scores_by_pair={"ETHBTC": 10.0, "BNBBTC": 9.0, "SOLBTC": 1.0, "XRPBTC": 0.5},
+        )
+        targets = bot.select_targets(scores)
+        # چون TOP_N اول (ETHBTC, BNBBTC با امتیاز 10 و 9) eligible نیستند، خروجی خالی می‌ماند
+        assert "ETHBTC" not in targets
+        assert "BNBBTC" not in targets
+        assert targets == [], (
+            "وقتی TOP_N اول ineligible باشند، خروجی باید خالی باشد (منطق نسخه‌ی اصلی)."
+        )
+
+    def test_selects_eligible_when_in_top_n(self):
+        """اگر eligibleها در TOP_N اول باشند، انتخاب می‌شوند."""
+        scores = self._make_scores(
+            eligible_pairs=["SOLBTC", "XRPBTC"],
+            scores_by_pair={"SOLBTC": 10.0, "XRPBTC": 9.0, "ETHBTC": 1.0, "BNBBTC": 0.5},
+        )
+        targets = bot.select_targets(scores)
+        # SOLBTC و XRPBTC در TOP_N اول هستند و eligible هستند
+        assert "SOLBTC" in targets
+        assert "XRPBTC" in targets
+        assert "ETHBTC" not in targets
+        assert "BNBBTC" not in targets
+        assert len(targets) == bot.TOP_N
+
+    def test_empty_scores_returns_empty(self):
+        """با scores خالی، خروجی لیست خالی باشد."""
+        targets = bot.select_targets({})
+        assert targets == []
+
+
 # ─────────────────────────── تست‌های ریبالانس ───────────────────────────
 class TestExecuteRebalance:
     def _flat_prices(self):
         return {p: 0.001 for p in bot.PAIRS}
 
     def _make_scores(self, eligible_pair="ETHBTC"):
-        """ساخت scores با یک جفت eligible و بقیه ineligible."""
         scores = {}
         for p in bot.PAIRS:
             eligible = (p == eligible_pair)
@@ -171,7 +268,9 @@ class TestExecuteRebalance:
         scores = self._make_scores(eligible_pair="ETHBTC")
         prices = self._flat_prices()
 
-        _targets, logs, _new_total, new_state = bot.execute_rebalance(state, scores, prices, "manual")
+        _targets, logs, _new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "manual"
+        )
 
         assert new_state["holdings"]["XRPBTC"] == 0.0
         assert any("فروش کامل XRPBTC" in log for log in logs)
@@ -182,24 +281,47 @@ class TestExecuteRebalance:
         scores = self._make_scores(eligible_pair="ETHBTC")
         prices = self._flat_prices()
 
-        _targets, logs, new_total, new_state = bot.execute_rebalance(state, scores, prices, "scheduled")
+        _targets, logs, new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "scheduled"
+        )
 
         eth_val = new_state["holdings"]["ETHBTC"] * prices["ETHBTC"]
         weight = eth_val / new_total
         # با تلورانس ۵٪ (به‌خاطر کارمزد)
         assert 0.15 <= weight <= 0.25, f"وزن ETHBTC باید ≈ 0.20 باشد ولی شد {weight}"
 
-    def test_small_trades_skipped(self):
-        """معاملات کوچک‌تر از آستانه انجام نشوند."""
+    def test_small_trades_skipped_for_buy_and_trim(self):
+        """معاملات کوچک‌تر از آستانه برای trim و buy انجام نشوند؛ اما sell همیشه انجام شود."""
         state = bot.default_state()
         state["btc_cash"] = 0.0001
         scores = self._make_scores(eligible_pair="ETHBTC")
         prices = self._flat_prices()
 
-        _targets, logs, _new_total, new_state = bot.execute_rebalance(state, scores, prices, "scheduled")
+        _targets, logs, _new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "scheduled"
+        )
 
-        #btc_cash نباید منفی شود
+        # btc_cash نباید منفی شود
         assert new_state["btc_cash"] >= 0.0
+
+    def test_small_non_target_asset_still_sold(self):
+        """دارایی خیلی کوچکِ خارج از هدف هم فروخته شود (رفتار نسخه‌ی اصلی)."""
+        state = bot.default_state()
+        state["btc_cash"] = 1.0
+        # مقدار خیلی کوچک از یک جفت‌ارز غیر هدف
+        state["holdings"]["XRPBTC"] = 0.00001  # ارزش = 0.00001 * 0.001 = 1e-8 BTC
+        scores = self._make_scores(eligible_pair="ETHBTC")
+        prices = self._flat_prices()
+
+        _targets, logs, _new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "manual"
+        )
+
+        # XRPBTC باید کامل فروخته شده باشد (حتی با ارزش خیلی کم)
+        assert new_state["holdings"]["XRPBTC"] == 0.0, (
+            "دارایی غیر هدف باید همیشه کامل فروخته شود، حتی اگر ارزشش زیر آستانه باشد."
+        )
+        assert any("فروش کامل XRPBTC" in log for log in logs)
 
     def test_btc_cash_never_negative(self):
         """btc_cash نباید منفی شود."""
@@ -208,7 +330,9 @@ class TestExecuteRebalance:
         scores = self._make_scores(eligible_pair="ETHBTC")
         prices = self._flat_prices()
 
-        _targets, logs, new_total, new_state = bot.execute_rebalance(state, scores, prices, "scheduled")
+        _targets, logs, new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "scheduled"
+        )
 
         assert new_state["btc_cash"] >= 0.0, "btc_cash نباید منفی شود"
 
@@ -226,8 +350,12 @@ class TestExecuteRebalance:
             "price": 0.001,
         }
 
-        old_total = state["btc_cash"] + sum(state["holdings"].get(p, 0.0) * prices[p] for p in bot.PAIRS)
-        _targets, logs, new_total, new_state = bot.execute_rebalance(state, scores, prices, "scheduled")
+        old_total = state["btc_cash"] + sum(
+            state["holdings"].get(p, 0.0) * prices[p] for p in bot.PAIRS
+        )
+        _targets, logs, new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "scheduled"
+        )
 
         fees = sum(t["fee_btc"] for t in new_state["trade_history"])
         drop = old_total - new_total
@@ -242,7 +370,9 @@ class TestExecuteRebalance:
         scores = self._make_scores(eligible_pair="ETHBTC")
         prices = self._flat_prices()
 
-        _targets, logs, new_total, new_state = bot.execute_rebalance(state, scores, prices, "manual")
+        _targets, logs, new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "manual"
+        )
 
         assert len(new_state["trade_history"]) > 0
         for t in new_state["trade_history"]:
@@ -250,8 +380,8 @@ class TestExecuteRebalance:
             assert "qty" in t and "price" in t and "gross_btc" in t and "fee_btc" in t
             assert t["reason"] == "manual"
 
-    def test_state_not_mutated_on_failure(self):
-        """در صورت خطا، state اصلی نباید دست بخورد (چون روی کپی کار می‌کنیم)."""
+    def test_state_not_mutated(self):
+        """state اصلی نباید تغییر کند (execute_rebalance روی کپی کار می‌کند)."""
         state = bot.default_state()
         original_history = list(state.get("trade_history", []))
         original_cash = state["btc_cash"]
@@ -259,11 +389,24 @@ class TestExecuteRebalance:
         scores = {}
         prices = self._flat_prices()
 
-        _targets, logs, new_total, new_state = bot.execute_rebalance(state, scores, prices, "manual")
+        _targets, logs, new_total, new_state = bot.execute_rebalance(
+            state, scores, prices, "manual"
+        )
 
-        # state اصلی نباید تغییر کرده باشد (execute_rebalance روی کپی کار می‌کند)
+        # state اصلی نباید تغییر کرده باشد
         assert state["btc_cash"] == original_cash
         assert state["trade_history"] == original_history
+
+    def test_execute_rebalance_returns_four_values(self):
+        """execute_rebalance باید دقیقاً ۴ مقدار برگرداند (targets, logs, new_total, new_state)."""
+        state = bot.default_state()
+        scores = self._make_scores(eligible_pair="ETHBTC")
+        prices = self._flat_prices()
+
+        result = bot.execute_rebalance(state, scores, prices, "manual")
+        assert isinstance(result, tuple) and len(result) == 4, (
+            "execute_rebalance باید ۴ مقدار برگرداند: (targets, logs, new_total, new_state)"
+        )
 
 
 # ─────────────────────────── تست‌های وضعیت ───────────────────────────
@@ -291,11 +434,17 @@ class TestStateStorage:
 
         original = {
             "btc_cash": 0.75,
-            "holdings": {"ETHBTC": 10.0, "BNBBTC": 0.0, "SOLBTC": 5.5, "XRPBTC": 0.0,
-                          "DOGEBTC": 0.0, "ADABTC": 0.0, "LTCBTC": 0.0},
+            "holdings": {
+                "ETHBTC": 10.0, "BNBBTC": 0.0, "SOLBTC": 5.5, "XRPBTC": 0.0,
+                "DOGEBTC": 0.0, "ADABTC": 0.0, "LTCBTC": 0.0,
+            },
             "last_rebalance_ts": 1234567890,
-            "trade_history": [{"ts": 1, "reason": "manual", "side": "buy", "pair": "ETHBTC",
-                               "qty": 1.0, "price": 0.001, "gross_btc": 0.001, "fee_btc": 0.00000075}],
+            "trade_history": [
+                {
+                    "ts": 1, "reason": "manual", "side": "buy", "pair": "ETHBTC",
+                    "qty": 1.0, "price": 0.001, "gross_btc": 0.001, "fee_btc": 0.00000075,
+                }
+            ],
         }
         storage.save(original)
         loaded = storage.load()
@@ -360,16 +509,197 @@ class TestIsDue:
 
 # ─────────────────────────── تست فیلتر چت ───────────────────────────
 class TestChatFilter:
-    def test_all_command_handlers_have_chat_filter(self):
-        """همه‌ی CommandHandlerها باید فیلتر چت داشته باشند."""
-        import inspect
-        src = inspect.getsource(bot)
-        # ۴ CommandHandler داریم: start, status, rebalance, history
-        assert src.count("CommandHandler(") == 4
-        # هر ۴ مورد باید filters=chat_filter داشته باشند
-        assert src.count("filters=chat_filter") >= 4, (
-            "همه‌ی CommandHandlerها باید filters=chat_filter داشته باشند"
+    def test_command_handlers_only_accept_allowed_chat(self):
+        """برای هر CommandHandler، پیام از چت مجاز پردازش شود و از چت دیگر رد شود.
+
+        از handler.check_update برای تست واقعی فیلتر استفاده می‌کنیم (نه inspect.getsource).
+        """
+        app = bot.build_application()
+
+        # گرفتن همه‌ی handlerها از همه‌ی گروه‌ها
+        all_handlers = []
+        for handlers in app.handlers.values():
+            all_handlers.extend(handlers)
+
+        command_handlers = [h for h in all_handlers if isinstance(h, CommandHandler)]
+        assert len(command_handlers) == 4, (
+            f"باید ۴ CommandHandler باشد (start, status, rebalance, history) ولی {len(command_handlers)} پیدا شد."
         )
+
+        for handler in command_handlers:
+            # handler.commands یک frozenset است؛ اولین عضو را می‌گیریم
+            cmd = list(handler.commands)[0]
+
+            # پیام از چت مجاز
+            allowed_update = _make_command_update(bot.ALLOWED_CHAT_ID, cmd)
+            # پیام از چت غیرمجاز
+            disallowed_update = _make_command_update(bot.ALLOWED_CHAT_ID + 999, cmd)
+
+            # check_update برای چت مجاز باید truthy (non-None, non-False) برگرداند
+            # و برای چت غیرمجاز falsy (None یا False)
+            allowed_result = handler.check_update(allowed_update)
+            disallowed_result = handler.check_update(disallowed_update)
+
+            assert allowed_result, (
+                f"Handler /{cmd} باید پیام از چت مجاز {bot.ALLOWED_CHAT_ID} را بپذیرد. "
+                f"نتیجه: {allowed_result!r}"
+            )
+            assert not disallowed_result, (
+                f"Handler /{cmd} نباید پیام از چت غیرمجاز {bot.ALLOWED_CHAT_ID + 999} را بپذیرد. "
+                f"نتیجه: {disallowed_result!r}"
+            )
+
+
+# ─────────────────────────── تست‌های format_status_message ───────────────────────────
+class TestFormatStatusMessage:
+    def _make_scores(self, eligible_pair="ETHBTC"):
+        scores = {}
+        for p in bot.PAIRS:
+            eligible = (p == eligible_pair)
+            scores[p] = {
+                "score": 1.0 if eligible else -1.0,
+                "return_10d": 5.0 if eligible else -5.0,
+                "trend_score": 0.1 if eligible else -0.1,
+                "eligible": eligible,
+                "price": 0.001,
+            }
+        return scores
+
+    def _make_prices(self):
+        return {p: 0.001 for p in bot.PAIRS}
+
+    def _make_state(self, last_rebalance_ts=0):
+        return {
+            "btc_cash": 1.0,
+            "holdings": {p: 0.0 for p in bot.PAIRS},
+            "last_rebalance_ts": last_rebalance_ts,
+            "trade_history": [],
+        }
+
+    def test_without_targets_and_logs_last_ts_zero(self):
+        """بدون targets و logs و با last_rebalance_ts=0، پیام باید متناسب بسازد."""
+        state = self._make_state(last_rebalance_ts=0)
+        scores = self._make_scores()
+        prices = self._make_prices()
+
+        msg = bot.format_status_message(state, scores, prices)
+
+        assert "ارزش کل پورتفو" in msg
+        assert "هنوز انجام نشده" in msg, "برای last_ts=0 باید پیام «هنوز انجام نشده» بیاید."
+        # نباید بخش تراکنش‌ها بیاید
+        assert "تراکنش‌های ریبالانس" not in msg
+
+    def test_with_targets_and_logs_last_ts_nonzero(self):
+        """با targets و logs و با last_rebalance_ts غیرصفر، پیام باید متناسب بسازد."""
+        ts = int(time.time()) - 100
+        state = self._make_state(last_rebalance_ts=ts)
+        scores = self._make_scores()
+        prices = self._make_prices()
+        targets = ["ETHBTC"]
+        logs = ["🟢 خرید ETHBTC → 0.200000 BTC"]
+
+        msg = bot.format_status_message(state, scores, prices, targets=targets, logs=logs)
+
+        assert "آخرین ریبالانس" in msg
+        assert "ریبالانس بعدی" in msg
+        assert "تراکنش‌های ریبالانس" in msg
+        assert "🟢 خرید ETHBTC" in msg
+
+    def test_does_not_raise_on_html_escape_format_spec(self):
+        """format spec نباید ValueError بدهد (تست باگ &lt;7)."""
+        state = self._make_state(last_rebalance_ts=0)
+        scores = self._make_scores()
+        prices = self._make_prices()
+
+        # این فراخوانی نباید exception بدهد
+        msg = bot.format_status_message(state, scores, prices)
+
+        assert isinstance(msg, str)
+        assert len(msg) > 0
+
+    def test_marks_only_target_pairs_with_check(self):
+        """فقط targets باید ✅ بگیرند، بقیه باید ▫️ داشته باشند."""
+        state = self._make_state(last_rebalance_ts=0)
+        scores = self._make_scores()
+        prices = self._make_prices()
+        targets = ["ETHBTC"]
+
+        msg = bot.format_status_message(state, scores, prices, targets=targets)
+
+        # ETHBTC در targets است → باید ✅ داشته باشد
+        # بقیه باید ▫️ داشته باشند
+        ethbtc_line = next(line for line in msg.split("\n") if "ETHBTC" in line and "بازدهی" in line)
+        assert "✅" in ethbtc_line
+
+        bnbbtc_line = next(line for line in msg.split("\n") if "BNBBTC" in line and "بازدهی" in line)
+        assert "✅" not in bnbbtc_line
+        assert "▫️" in bnbbtc_line
+
+
+# ─────────────────────────── تست‌های format_history_message ───────────────────────────
+class TestFormatHistoryMessage:
+    def test_empty_history(self):
+        """با trade_history خالی، پیام «هنوز هیچ معامله‌ای» بدهد."""
+        state = {"trade_history": []}
+        msg = bot.format_history_message(state)
+        assert "هنوز هیچ معامله‌ای" in msg
+
+    def test_with_trades(self):
+        """با معاملات، پیام باید شامل جزئیات معامله باشد."""
+        state = {
+            "trade_history": [
+                {
+                    "ts": int(time.time()),
+                    "reason": "manual",
+                    "side": "buy",
+                    "pair": "ETHBTC",
+                    "qty": 100.0,
+                    "price": 0.001,
+                    "gross_btc": 0.1,
+                    "fee_btc": 0.000075,
+                },
+                {
+                    "ts": int(time.time()) - 60,
+                    "reason": "scheduled",
+                    "side": "sell",
+                    "pair": "XRPBTC",
+                    "qty": 50.0,
+                    "price": 0.002,
+                    "gross_btc": 0.1,
+                    "fee_btc": 0.000075,
+                },
+            ]
+        }
+        msg = bot.format_history_message(state)
+        assert "ETHBTC" in msg
+        assert "buy" in msg
+        assert "manual" in msg
+        assert "XRPBTC" in msg
+        assert "sell" in msg
+        assert "scheduled" in msg
+
+    def test_does_not_raise_on_html_escape(self):
+        """با کاراکترهای خاص در pair، نباید exception بدهد."""
+        state = {
+            "trade_history": [
+                {
+                    "ts": int(time.time()),
+                    "reason": "manual",
+                    "side": "buy",
+                    "pair": "ETH<BTC",  # کاراکتر HTML خاص
+                    "qty": 1.0,
+                    "price": 0.001,
+                    "gross_btc": 0.001,
+                    "fee_btc": 0.00000075,
+                }
+            ]
+        }
+        # این فراخوانی نباید exception بدهد (html.escape باید &lt; کند)
+        msg = bot.format_history_message(state)
+        assert isinstance(msg, str)
+        # کاراکتر < نباید به‌صورت خام در خروجی باشد (escape شده)
+        assert "ETH<BTC" not in msg
+        assert "ETH&lt;BTC" in msg
 
 
 # ─────────────────────────── تست اعتبارسنجی TELEGRAM_CHAT_ID ───────────────────────────

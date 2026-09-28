@@ -32,6 +32,7 @@ import requests
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -43,7 +44,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# httpx در سطح INFO آدرس کامل درخواست‌ها را لاگ می‌کند که شامل توکن ربات است
+# httpx در سطح INFO نویز زیادی تولید می‌کند؛ سطح WARNING برای کاهش لاگ.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("CryptoMomentumBot")
 
@@ -54,7 +55,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STATE_FILE = os.getenv("STATE_FILE", "portfolio_state.json")
 
 # اعتبارسنجی TELEGRAM_CHAT_ID: باید عدد صحیح باشد وگرنه برنامه نباید بالا بیاید.
-# این کار از نشت احتمالی توکن به چت‌های غیرمجاز جلوگیری می‌کند.
+# این کار از کار کردن ربات در چت غیرمجاز جلوگیری می‌کند.
 if not TELEGRAM_CHAT_ID:
     raise SystemExit(
         "متغیر TELEGRAM_CHAT_ID تعریف نشده است. "
@@ -99,6 +100,7 @@ KLINE_ENDPOINTS = (
 )
 
 REBALANCE_INTERVAL_SECONDS = REBALANCE_INTERVAL_HOURS * 3600
+ERROR_NOTIFY_INTERVAL_SECONDS = 6 * 3600  # حداقل فاصله‌ی اطلاع‌رسانی خطای ریبالانس خودکار (۶ ساعت)
 
 if TOP_N * WEIGHT_PER_ASSET > 1.0:
     raise ValueError("TOP_N × WEIGHT_PER_ASSET نباید از ۱ بیشتر باشد.")
@@ -150,7 +152,7 @@ class PostgresStorage:
     """ذخیره در PostgreSQL (مناسب Heroku و سرویس‌هایی با فایل‌سیستم موقتی).
 
     از psycopg2 استفاده می‌کند. جدول bot_state به‌صورت خودکار ساخته می‌شود و
-    رکورد با id=1 به‌صورت upsert ذخیره می‌شود.
+    رکورد با id=1 به‌صورت upsert ذخیره می‌شود. هر اتصال با contextlib.closing بسته می‌شود.
     """
 
     def __init__(self, dsn: str):
@@ -160,7 +162,7 @@ class PostgresStorage:
         self._psycopg2 = psycopg2
         self._Json = Json
         self._dsn = dsn
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -178,7 +180,7 @@ class PostgresStorage:
 
     def load(self) -> dict | None:
         try:
-            with self._connect() as conn:
+            with contextlib.closing(self._connect()) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT data FROM bot_state WHERE id = 1")
                     row = cur.fetchone()
@@ -188,7 +190,7 @@ class PostgresStorage:
 
     def save(self, state: dict) -> None:
         try:
-            with self._connect() as conn:
+            with contextlib.closing(self._connect()) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -218,6 +220,11 @@ _storage: FileStorage | PostgresStorage | None = None
 
 
 def get_storage() -> FileStorage | PostgresStorage:
+    """دسترسی به singleton استوریج؛ در اولین فراخوانی ساخته می‌شود.
+
+    اگر دیتابیس در دسترس نباشد، در همین نقطه خطا می‌دهد (به‌جای اینکه در
+    اولین rebalance خراب شود).
+    """
     global _storage
     if _storage is None:
         _storage = build_storage()
@@ -263,13 +270,11 @@ def normalize_state(raw: dict | None) -> dict:
             qty_float = float(qty)
         except (TypeError, ValueError) as exc:
             raise StateError(f"مقدار دارایی برای {pair} عدد نیست: {exc}") from exc
-        # جفت‌ارز خارج از PAIRS با مقدار مثبت → خطا
         if pair not in PAIRS and qty_float > 0:
             raise StateError(
                 f"دارایی مثبت برای جفت‌ارز ناشناخته '{pair}' در وضعیت ثبت شده است. "
                 "امکان ادامه‌ی امن وجود ندارد."
             )
-        # جفت‌ارزهای داخل PAIRS یا جفت‌ارزهای خارج از PAIRS با مقدار صفر حفظ می‌شوند.
         holdings[pair] = qty_float
 
     raw_history = raw.get("trade_history") or []
@@ -368,6 +373,20 @@ def fetch_pair_data(symbol: str) -> tuple[np.ndarray, float]:
 
 
 # ─────────────────────────── استراتژی ───────────────────────────
+def select_targets(scores: dict) -> list[str]:
+    """انتخاب TOP_N جفت‌ارز واجد (eligible) با بالاترین امتیاز.
+
+    منطق انتخاب دقیقاً مطابق نسخه‌ی اصلی:
+        ۱. مرتب‌سازی بر اساس امتیاز نزولی.
+        ۲. گرفتن TOP_N رتبه‌ی اول.
+        ۳. فیلتر فقط eligible ها.
+
+    این تابع برای استفاده‌ی مجدد در /status (پیش‌نمایش اهداف) و execute_rebalance است.
+    """
+    sorted_pairs = sorted(scores.keys(), key=lambda p: scores[p]["score"], reverse=True)
+    return [p for p in sorted_pairs[:TOP_N] if scores[p].get("eligible", False)]
+
+
 def compute_hybrid_scores() -> tuple[dict, dict]:
     """محاسبه‌ی امتیاز هیبریدی برای همه‌ی جفت‌ارزها.
 
@@ -439,17 +458,20 @@ def execute_rebalance(
     scores: dict,
     prices: dict,
     reason: str = "scheduled",
-) -> tuple[list[str], list[str], float]:
+) -> tuple[list[str], list[str], float, dict]:
     """اجرای یک چرخه‌ی ریبالانس روی یک کپی از state.
 
     مراحل (طبق مشخصات):
-        (الف) فروش کامل ارزهایی که دیگر هدف نیستند.
+        (الف) فروش کامل ارزهای غیر هدف — همیشه، حتی اگر ارزششان کمتر از آستانه باشد.
+            (رفتار نسخه‌ی اصلی: آستانه فقط برای trim و buy است.)
         (ب) محاسبه‌ی target_val بر اساس ارزش سبد بعد از فروش‌ها.
-        (ج) کاهش وزن ارزهای بیش‌وزن (کاهش وزن، نه سیو سود).
-        (د) خرید با min(deficit, btc_cash).
+        (ج) کاهش وزن ارزهای هدف بیش‌وزن (با رعایت MIN_TRADE_FRACTION).
+        (د) خرید با min(deficit, btc_cash) (با رعایت MIN_TRADE_FRACTION).
 
-    معاملات کوچک‌تر از MIN_TRADE_FRACTION × ارزش سبد انجام نمی‌شوند.
     btc_cash هیچ‌وقت منفی نمی‌شود.
+    کار روی یک کپی از state انجام می‌شود؛ فقط در صورت موفقیت در خروجی ذخیره می‌شود.
+
+    خروجی: (targets, logs, new_total, new_state)
     """
     # کار روی یک کپی از state؛ فقط در صورت موفقیت در خروجی ذخیره می‌شود.
     new_state = {
@@ -467,15 +489,7 @@ def execute_rebalance(
     history = new_state["trade_history"]
     logs: list[str] = []
 
-    # انتخاب هدف‌ها: از بین TOP_N رتبه‌ی اول فقط eligible ها
-    sorted_pairs = sorted(scores.keys(), key=lambda p: scores[p]["score"], reverse=True)
-    targets = [p for p in sorted_pairs[:TOP_N] if scores[p].get("eligible", False)]
-
-    # محاسبه‌ی ارزش فعلی سبد (قبل از هر معامله) برای آستانه‌ی معامله
-    def _portfolio_value_after() -> float:
-        return btc_cash + sum(holdings.get(p, 0.0) * prices[p] for p in PAIRS)
-
-    min_trade_value = MIN_TRADE_FRACTION * _portfolio_value_after()
+    targets = select_targets(scores)
 
     def _record(side: str, pair: str, qty: float, price: float, gross_btc_override: float | None = None) -> None:
         """ثبت یک معامله در trade_history.
@@ -499,15 +513,11 @@ def execute_rebalance(
         if len(history) > MAX_TRADE_HISTORY:
             del history[: len(history) - MAX_TRADE_HISTORY]
 
-    # (الف) فروش کامل ارزهای غیر هدف
+    # (الف) فروش کامل ارزهای غیر هدف — همیشه، حتی اگر ارزش کم باشد
     for p in PAIRS:
         qty = holdings.get(p, 0.0)
         if p not in targets and qty > 0:
             sold_value = qty * prices[p]
-            if sold_value < min_trade_value:
-                # معامله‌ی کوچک‌تر از آستانه انجام نمی‌شود؛ دارایی حفظ می‌شود
-                logs.append(f"⚪ حفظ {p} (مقدار فروش زیر آستانه)")
-                continue
             proceeds = sold_value * (1 - FEE)
             btc_cash += proceeds
             holdings[p] = 0.0
@@ -568,6 +578,7 @@ def format_status_message(
     targets: list[str] | None = None,
     logs: list[str] | None = None,
 ) -> str:
+    """ساخت پیام /status (و پیام پس از ریبالانس) با HTML-escaped بودن متن‌های متغیر."""
     total_val, _unknown = portfolio_value(state, prices)
     targets = targets or []
 
@@ -605,8 +616,9 @@ def format_status_message(
         sc = scores[p]
         status = "✅" if p in targets else "▫️"
         eligible_marker = "" if sc.get("eligible") else " (غیرواجد)"
+        # فقط < به‌عنوان format spec (left-align)؛ نه HTML entity
         msg += (
-            f"{status} <code>{html.escape(p):&lt;7}</code> | "
+            f"{status} <code>{html.escape(p):<7}</code> | "
             f"بازدهی: <code>{sc['return_10d']:>+5.1f}%</code> | "
             f"امتیاز: <code>{sc['score']:>+4.2f}</code>{eligible_marker}\n"
         )
@@ -617,9 +629,36 @@ def format_status_message(
     return msg
 
 
+def format_history_message(state: dict) -> str:
+    """ساخت پیام /history از روی state. جدا شده تا قابل تست باشد."""
+    history = state.get("trade_history") or []
+    if not history:
+        return "📭 هنوز هیچ معامله‌ای ثبت نشده است."
+    last = history[-HISTORY_SHOW:]
+    last.reverse()  # آخرین معامله اول نمایش داده شود
+    lines = ["📜 <b>۱۰ معامله‌ی آخر:</b>\n"]
+    for i, t in enumerate(last, start=1):
+        ts = t.get("ts", 0)
+        dt = datetime.fromtimestamp(ts, tz=BOT_TIMEZONE) if ts else None
+        ts_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
+        side = t.get("side", "?")
+        pair = html.escape(str(t.get("pair", "?")))
+        qty = float(t.get("qty", 0.0))
+        price = float(t.get("price", 0.0))
+        gross = float(t.get("gross_btc", 0.0))
+        fee = float(t.get("fee_btc", 0.0))
+        reason = html.escape(str(t.get("reason", "?")))
+        side_emoji = {"buy": "🟢", "sell": "🔴", "trim": "🟡"}.get(side, "⚪")
+        lines.append(
+            f"{i}. {side_emoji} <code>{pair}</code> | {side} | {qty:.6f} @ {price:.8f} BTC"
+            f" | gross={gross:.6f} BTC | fee={fee:.6f} BTC | {reason} | {ts_str}"
+        )
+    return "\n".join(lines)
+
+
 # ─────────────────────────── دستورات تلگرام ───────────────────────────
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "ربات معامله‌گر هیبریدی ۱۰ روزه فعال است.\n\n"
         "دستورات:\n"
         "/status - نمایش وضعیت فعلی پورتفو و رتبه‌بندی ارزها\n"
@@ -629,15 +668,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("در حال دریافت داده‌های بازار و محاسبه Z-Score...")
+    await update.effective_message.reply_text("در حال دریافت داده‌های بازار و محاسبه Z-Score...")
     try:
         state = await asyncio.to_thread(load_state)
         scores, prices = await asyncio.to_thread(compute_hybrid_scores)
-        msg = format_status_message(state, scores, prices)
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        # پیش‌نمایش اهدافی که در همین لحظه انتخاب می‌شدند (بدون انجام معامله)
+        targets = select_targets(scores)
+        msg = format_status_message(state, scores, prices, targets=targets)
+        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
         logger.exception("خطا در /status")
-        await update.message.reply_text(f"خطا در پردازش: {html.escape(str(exc))}")
+        await update.effective_message.reply_text(f"خطا در پردازش: {html.escape(str(exc))}")
 
 
 async def manual_rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -647,59 +688,73 @@ async def manual_rebalance_command(update: Update, context: ContextTypes.DEFAULT
         lock = asyncio.Lock()
         context.application.bot_data["rebalance_lock"] = lock
     if lock.locked():
-        await update.message.reply_text("⛔ ریبالانس دیگری در حال اجراست. لطفاً چند لحظه بعد تلاش کنید.")
+        await update.effective_message.reply_text(
+            "⛔ ریبالانس دیگری در حال اجراست. لطفاً چند لحظه بعد تلاش کنید."
+        )
         return
 
     async with lock:
-        await update.message.reply_text("در حال اجرای ریبالانس...")
+        await update.effective_message.reply_text("در حال اجرای ریبالانس...")
+        # ─── فاز ۱: اجرای ریبالانس و ذخیره‌ی وضعیت ───
         try:
             state = await asyncio.to_thread(load_state)
             scores, prices = await asyncio.to_thread(compute_hybrid_scores)
             targets, logs, _new_total, new_state = await asyncio.to_thread(
                 execute_rebalance, state, scores, prices, "manual"
             )
-            # ذخیره‌ی فقط در صورت موفقیت
             await asyncio.to_thread(save_state, new_state)
+        except Exception as exc:
+            logger.exception("خطا در /rebalance (فاز اجرا/ذخیره)")
+            await update.effective_message.reply_text(f"خطا در ریبالانس: {html.escape(str(exc))}")
+            return
+
+        # ─── فاز ۲: ساخت و ارسال پیام (ذخیره قبلاً موفق بوده) ───
+        try:
             msg = format_status_message(new_state, scores, prices, targets=targets, logs=logs)
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"⚡ <b>ریبالانس دستی اجرا شد:</b>\n\n{msg}",
                 parse_mode=ParseMode.HTML,
             )
-        except Exception as exc:
-            logger.exception("خطا در /rebalance")
-            await update.message.reply_text(f"خطا در ریبالانس: {html.escape(str(exc))}")
+        except Exception:
+            logger.exception("خطا در ساخت/ارسال گزارش ریبالانس دستی")
+            await update.effective_message.reply_text(
+                "✅ ریبالانس انجام و ذخیره شد ولی ساخت گزارش ناموفق بود."
+            )
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         state = await asyncio.to_thread(load_state)
-        history = state.get("trade_history") or []
-        if not history:
-            await update.message.reply_text("📭 هنوز هیچ معامله‌ای ثبت نشده است.")
-            return
-        last = history[-HISTORY_SHOW:]
-        last.reverse()  # آخرین معامله اول نمایش داده شود
-        lines = ["📜 <b>۱۰ معامله‌ی آخر:</b>\n"]
-        for i, t in enumerate(last, start=1):
-            ts = t.get("ts", 0)
-            dt = datetime.fromtimestamp(ts, tz=BOT_TIMEZONE) if ts else None
-            ts_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
-            side = t.get("side", "?")
-            pair = html.escape(str(t.get("pair", "?")))
-            qty = float(t.get("qty", 0.0))
-            price = float(t.get("price", 0.0))
-            gross = float(t.get("gross_btc", 0.0))
-            fee = float(t.get("fee_btc", 0.0))
-            reason = html.escape(str(t.get("reason", "?")))
-            side_emoji = {"buy": "🟢", "sell": "🔴", "trim": "🟡"}.get(side, "⚪")
-            lines.append(
-                f"{i}. {side_emoji} <code>{pair}</code> | {side} | {qty:.6f} @ {price:.8f} BTC"
-                f" | gross={gross:.6f} BTC | fee={fee:.6f} BTC | {reason} | {ts_str}"
-            )
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        msg = format_history_message(state)
+        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
         logger.exception("خطا در /history")
-        await update.message.reply_text(f"خطا در نمایش تاریخچه: {html.escape(str(exc))}")
+        await update.effective_message.reply_text(f"خطا در نمایش تاریخچه: {html.escape(str(exc))}")
+
+
+async def _send_error_notification(context: ContextTypes.DEFAULT_TYPE, message: str) -> None:
+    """ارسال اطلاع‌رسانی خطای ریبالانس خودکار به ALLOWED_CHAT_ID.
+
+    حداقل فاصله‌ی دو اطلاع‌رسانی ERROR_NOTIFY_INTERVAL_SECONDS (۶ ساعت) است.
+    زمان آخرین اطلاع‌رسانی در bot_data["last_error_notification_ts"] نگه داشته می‌شود.
+    """
+    now = int(time.time())
+    last_notification = context.application.bot_data.get("last_error_notification_ts", 0)
+    if now - last_notification < ERROR_NOTIFY_INTERVAL_SECONDS:
+        logger.warning(
+            "اطلاع‌رسانی خطا رد شد (اخیراً ارسال شده؛ %d ثانیه پیش).",
+            now - last_notification,
+        )
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=f"⚠️ <b>خطای ریبالانس خودکار</b>\n\n{html.escape(message)}",
+            parse_mode=ParseMode.HTML,
+        )
+        context.application.bot_data["last_error_notification_ts"] = now
+    except Exception:
+        logger.exception("ارسال اطلاع‌رسانی خطا ناموفق بود")
 
 
 # تابع بازبینی خودکار متصل به JobQueue استاندارد تلگرام
@@ -713,6 +768,7 @@ async def check_scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     async with lock:
+        # ─── فاز ۱: اجرای ریبالانس و ذخیره ───
         try:
             state = await asyncio.to_thread(load_state)
             # بررسی سررسید داخل قفل
@@ -724,18 +780,28 @@ async def check_scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 execute_rebalance, state, scores, prices, "scheduled"
             )
             await asyncio.to_thread(save_state, new_state)
-            msg = format_status_message(new_state, scores, prices, targets=targets, logs=logs)
-            if ALLOWED_CHAT_ID is not None:
-                await context.bot.send_message(
-                    chat_id=ALLOWED_CHAT_ID,
-                    text=f"🚨 <b>اجرای سررسید دوره ۱۰ روزه (ریبالانس خودکار)</b>\n\n{msg}",
-                    parse_mode=ParseMode.HTML,
-                )
         except Exception as exc:
-            logger.exception("خطا در جاب دوره‌ای")
+            logger.exception("خطا در جاب دوره‌ای (فاز اجرا/ذخیره)")
+            await _send_error_notification(context, f"خطا در اجرای ریبالانس خودکار: {exc}")
+            return
+
+        # ─── فاز ۲: ساخت و ارسال پیام (ذخیره قبلاً موفق بوده) ───
+        try:
+            msg = format_status_message(new_state, scores, prices, targets=targets, logs=logs)
+            await context.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=f"🚨 <b>اجرای سررسید دوره ۱۰ روزه (ریبالانس خودکار)</b>\n\n{msg}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception("خطا در ساخت/ارسال گزارش ریبالانس خودکار")
+            await _send_error_notification(
+                context,
+                "ریبالانس خودکار انجام و ذخیره شد ولی ساخت/ارسال گزارش ناموفق بود.",
+            )
 
 
-async def post_init(app) -> None:
+async def post_init(app: Application) -> None:
     """ساخت قفل ریبالانس پس از مقداردهی اولیه‌ی Application."""
     app.bot_data.setdefault("rebalance_lock", asyncio.Lock())
 
@@ -751,14 +817,11 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             )
 
 
-def main() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("متغیر TELEGRAM_BOT_TOKEN تعریف نشده است. اجرای ربات متوقف می‌شود.")
-    if ALLOWED_CHAT_ID is None:
-        raise SystemExit(
-            "متغیر TELEGRAM_CHAT_ID تعریف نشده یا عدد نیست. اجرای ربات متوقف می‌شود."
-        )
+def build_application() -> Application:
+    """ساخت Application تلگرام با همه‌ی handlerها و فیلتر چت.
 
+    این تابع برای تست‌ها نیز قابل استفاده است (بدون run_polling).
+    """
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -774,6 +837,19 @@ def main() -> None:
 
     app.add_error_handler(global_error_handler)
 
+    return app
+
+
+def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit("متغیر TELEGRAM_BOT_TOKEN تعریف نشده است. اجرای ربات متوقف می‌شود.")
+
+    # مقداردهی اولیه‌ی storage برای выяв کردن زودهنگام خطاهای اتصال به دیتابیس
+    # (قبل از run_polling). اگر DATABASE_URL در دسترس نباشد، اینجا خطا می‌دهد.
+    get_storage()
+
+    app = build_application()
+
     # زمان‌بندی با JobQueue استاندارد تلگرام؛ بدون حلقه‌ی while یا create_task
     if app.job_queue is not None:
         app.job_queue.run_repeating(
@@ -786,7 +862,7 @@ def main() -> None:
         logger.warning("JobQueue در دسترس نیست؛ ریبالانس خودکار غیرفعال می‌شود.")
 
     logger.info("ربات با موفقیت استارت خورد.")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
