@@ -1,5 +1,5 @@
 .env
-[portfolio_state.json](https://portfolio_state.json)
+portfolio_state.json*
 .state-*.tmp
 __pycache__/
 *.pyc

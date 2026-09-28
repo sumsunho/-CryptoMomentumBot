@@ -1,1 +1,1 @@
-worker: python [bot.py](https://bot.py)
+worker: python bot.py
