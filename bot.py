@@ -2,12 +2,17 @@
 CryptoMomentumBot
 ربات تلگرامی معامله‌ی شبیه‌سازی‌شده (Paper Trading) با استراتژی مومنتوم نسبت به BTC.
 
+هیچ سفارش واقعی ثبت نمی‌کند و هیچ API صرافی با کلید خصوصی استفاده نمی‌شود.
+تمام داده‌های بازار از اندپوینت‌های عمومی Binance خوانده می‌شوند.
+
 متغیرهای محیطی:
-    TELEGRAM_BOT_TOKEN   (الزامی) توکن ربات
-    TELEGRAM_CHAT_ID     (الزامی) شناسه‌ی عددی چتی که اجازه‌ی کار با ربات را دارد
-    DATABASE_URL         (اختیاری) اگر تعریف شود، وضعیت در PostgreSQL ذخیره می‌شود
-    STATE_FILE           (اختیاری) مسیر فایل وضعیت وقتی دیتابیس نداری (پیش‌فرض: [portfolio_state.jso](https://portfolio_state.jso)n)
-    DISPLAY_TZ           (اختیاری) منطقه‌ی زمانی نمایش (پیش‌فرض: Asia/Tehran)
+    TELEGRAM_BOT_TOKEN      (الزامی) توکن ربات تلگرام
+    TELEGRAM_CHAT_ID        (الزامی) شناسه‌ی عددی چتی که اجازه‌ی کار با ربات را دارد
+    DATABASE_URL            (اختیاری) اگر تعریف شود، وضعیت در PostgreSQL ذخیره می‌شود
+    STATE_FILE              (اختیاری) مسیر فایل وضعیت وقتی دیتابیس ندارید (پیش‌فرض: portfolio_state.json)
+    BOT_TIMEZONE            (اختیاری) منطقه‌ی زمانی نمایش (پیش‌فرض: Asia/Tehran)
+    LOOKBACK_HOURS           (اختیاری) پنجره‌ی محاسبه‌ی مومنتوم به ساعت (پیش‌فرض: 240)
+    REBALANCE_INTERVAL_HOURS (اختیاری) فاصله‌ی ریبالانس خودکار به ساعت (پیش‌فرض: 240)
 """
 from __future__ import annotations
 
@@ -19,50 +24,71 @@ import logging
 import os
 import tempfile
 import time
-from [concurrent.futures](https://concurrent.futures) import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import requests
 from telegram import Update
-from [telegram.constants](https://telegram.constants) import ParseMode
-from [telegram.ext](https://telegram.ext) import ApplicationBuilder, CommandHandler, ContextTypes, filters
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    filters,
+)
 
 # ─────────────────────────── لاگ ───────────────────────────
-[logging.basicConfig](https://logging.basicConfig)(
+logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 # httpx در سطح INFO آدرس کامل درخواست‌ها را لاگ می‌کند که شامل توکن ربات است
-[logging.getLogger](https://logging.getLogger)("httpx").setLevel([logging.WARNIN](https://logging.WARNIN)G)
-logger = [logging.getLogger](https://logging.getLogger)("CryptoMomentumBot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("CryptoMomentumBot")
 
 # ─────────────────────────── تنظیمات ───────────────────────────
-TELEGRAM_BOT_TOKEN = [os.getenv](https://os.getenv)("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = [os.getenv](https://os.getenv)("TELEGRAM_CHAT_ID", "").strip()
-DATABASE_URL = [os.getenv](https://os.getenv)("DATABASE_URL", "").strip()
-STATE_FILE = [os.getenv](https://os.getenv)("STATE_FILE", "portfolio_state.json")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+STATE_FILE = os.getenv("STATE_FILE", "portfolio_state.json")
+
+# اعتبارسنجی TELEGRAM_CHAT_ID: باید عدد صحیح باشد وگرنه برنامه نباید بالا بیاید.
+# این کار از نشت احتمالی توکن به چت‌های غیرمجاز جلوگیری می‌کند.
+if not TELEGRAM_CHAT_ID:
+    raise SystemExit(
+        "متغیر TELEGRAM_CHAT_ID تعریف نشده است. "
+        "این متغیر باید شناسه‌ی عددی چت مجاز باشد. اجرای ربات متوقف می‌شود."
+    )
+try:
+    ALLOWED_CHAT_ID: int = int(TELEGRAM_CHAT_ID)
+except (TypeError, ValueError):
+    raise SystemExit(
+        f"متغیر TELEGRAM_CHAT_ID مقدار '{TELEGRAM_CHAT_ID}' عدد نیست. "
+        "این متغیر باید شناسه‌ی عددی چت مجاز باشد. اجرای ربات متوقف می‌شود."
+    )
 
 try:
-    DISPLAY_TZ = ZoneInfo([os.getenv](https://os.getenv)("DISPLAY_TZ", "Asia/Tehran"))
+    BOT_TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Asia/Tehran"))
 except (ZoneInfoNotFoundError, ValueError):
-    DISPLAY_TZ = [timezone.utc](https://timezone.utc)
+    BOT_TIMEZONE = timezone.utc
 
 PAIRS = ["ETHBTC", "BNBBTC", "SOLBTC", "XRPBTC", "DOGEBTC", "ADABTC", "LTCBTC"]
 
-LOOKBACK_HOURS = 240                      # پنجره‌ی محاسبه‌ی مومنتوم (۱۰ روز)
-REBALANCE_INTERVAL_SECONDS = 240 * 3600   # فاصله‌ی ریبالانس خودکار (۱۰ روز)
-CHECK_INTERVAL_SECONDS = 3600             # هر چند وقت سررسید بررسی شود
-
+# پارامترهای استراتژی (نباید تغییر کنند)
 TOP_N = 2                  # تعداد ارزهای منتخب
-WEIGHT_PER_ASSET = 0.20    # وزن هر ارز؛ با 2×0.20، ۶۰٪ سبد BTC نقد می‌ماند. برای سرمایه‌گذاری کامل: 0.50
+WEIGHT_PER_ASSET = 0.20    # وزن هر ارز؛ با 2×0.20، ۶۰٪ سبد BTC نقد می‌ماند
 REQUIRE_BOTH_POSITIVE = False   # True = شرط ورود سخت‌گیرانه (بازده و روند هر دو مثبت)
-MIN_TRADE_FRACTION = 0.01  # معاملات کوچک‌تر از ۱٪ ارزش سبد انجام نمی‌شوند
+
+# پارامترهای قابل تنظیم با حفظ مقدار پیش‌فرض فعلی
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "240"))
+REBALANCE_INTERVAL_HOURS = int(os.getenv("REBALANCE_INTERVAL_HOURS", "240"))
+CHECK_INTERVAL_SECONDS = 3600             # هر چند وقت سررسید بررسی شود
+MIN_TRADE_FRACTION = 0.01                 # معاملات کوچک‌تر از ۱٪ ارزش سبد انجام نمی‌شوند
 FEE = 0.00075
 INITIAL_BTC = 1.0
-MAX_TRADE_HISTORY = 1000
-HISTORY_SHOW = 15
+MAX_TRADE_HISTORY = 500                   # حداکثر ۵۰۰ رکورد آخر نگه داشته شود
+HISTORY_SHOW = 10                         # تعداد معاملات نمایش‌داده‌شده در /history
 
 REQUEST_TIMEOUT = 10
 FETCH_RETRIES = 3
@@ -72,92 +98,131 @@ KLINE_ENDPOINTS = (
     "https://api.binance.com/api/v3/klines",
 )
 
+REBALANCE_INTERVAL_SECONDS = REBALANCE_INTERVAL_HOURS * 3600
+
 if TOP_N * WEIGHT_PER_ASSET > 1.0:
     raise ValueError("TOP_N × WEIGHT_PER_ASSET نباید از ۱ بیشتر باشد.")
 
-class DataFetchError(RuntimeError):
-    pass
+
+# ─────────────────────────── خطاهای سفارشی ───────────────────────────
+class StateError(RuntimeError):
+    """خطای مربوط به وضعیت ذخیره‌شده (فایل خراب، رکورد نامعتبر، و غیره)."""
+
+
+class MarketDataError(RuntimeError):
+    """خطای مربوط به دریافت داده‌های بازار."""
+
 
 # ─────────────────────────── ذخیره‌سازی ───────────────────────────
 class FileStorage:
-    """ذخیره در فایل JSON با نوشتن اتمیک."""
+    """ذخیره در فایل JSON با نوشتن اتمیک (tmp + fsync + os.replace)."""
 
     def __init__(self, path: str):
-        [self.path](https://self.path) = path
+        self.path = path
 
     def load(self) -> dict | None:
-        if not [os.path.exists](https://os.path.exists)([self.pat](https://self.pat)h):
+        if not os.path.exists(self.path):
             return None
-        # اگر فایل خراب باشد خطا می‌دهد؛ عمداً سبد را بی‌صدا ریست نمی‌کنیم
-        with open([self.path](https://self.path), "r", encoding="utf-8") as f:
-            return [json.load](https://json.load)(f)
+        # اگر فایل خراب باشد خطا می‌دهیم؛ عمداً سبد را بی‌صدا ریست نمی‌کنیم.
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise StateError(f"فایل وضعیت خراب است و قابل خواندن نیست: {self.path} ({exc})") from exc
 
     def save(self, state: dict) -> None:
-        directory = [os.path.dirname](https://os.path.dirname)([os.path.abspath](https://os.path.abspath)([self.pat](https://self.pat)h))
-        [os.makedirs](https://os.makedirs)(directory, exist_ok=True)
-        fd, tmp_path = [tempfile.mkstemp](https://tempfile.mkstemp)(dir=directory, prefix=".state-", suffix=".tmp")
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".state-", suffix=".tmp")
         try:
-            with [os.fdopen](https://os.fdopen)(fd, "w", encoding="utf-8") as f:
-                [json.dump](https://json.dump)(state, f, indent=2, ensure_ascii=False)
-                [f.flush](https://f.flush)()
-                [os.fsync](https://os.fsync)([f.fileno](https://f.fileno)())
-            [os.replace](https://os.replace)(tmp_path, [self.pat](https://self.pat)h)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
         except BaseException:
-            with [contextlib.suppress](https://contextlib.suppress)(FileNotFoundError):
-                [os.remove](https://os.remove)(tmp_path)
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_path)
             raise
 
+
 class PostgresStorage:
-    """ذخیره در PostgreSQL (مناسب Heroku و سرویس‌هایی با فایل‌سیستم موقتی)."""
+    """ذخیره در PostgreSQL (مناسب Heroku و سرویس‌هایی با فایل‌سیستم موقتی).
+
+    از psycopg2 استفاده می‌کند. جدول bot_state به‌صورت خودکار ساخته می‌شود و
+    رکورد با id=1 به‌صورت upsert ذخیره می‌شود.
+    """
 
     def __init__(self, dsn: str):
-        import psycopg
-        from [psycopg.types.json](https://psycopg.types.json) import Jsonb
+        import psycopg2
+        from psycopg2.extras import Json
 
-        self._psycopg = psycopg
-        self._Jsonb = Jsonb
+        self._psycopg2 = psycopg2
+        self._Json = Json
         self._dsn = dsn
         with self._connect() as conn:
-            [conn.execute](https://conn.execute)(
-                """
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    id         INTEGER PRIMARY KEY,
-                    data       JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        id         INTEGER PRIMARY KEY,
+                        data       JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
                 )
-                """
-            )
+            conn.commit()
 
     def _connect(self):
-        return [self._psycopg.connect](https://self._psycopg.connect)(self._dsn, connect_timeout=10)
+        return self._psycopg2.connect(self._dsn, connect_timeout=10)
 
     def load(self) -> dict | None:
-        with self._connect() as conn:
-            row = [conn.execute](https://conn.execute)("SELECT data FROM bot_state WHERE id = 1").fetchone()
-        return row[0] if row else None
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT data FROM bot_state WHERE id = 1")
+                    row = cur.fetchone()
+            return row[0] if row else None
+        except self._psycopg2.Error as exc:
+            raise StateError(f"خطا در خواندن وضعیت از PostgreSQL: {exc}") from exc
 
     def save(self, state: dict) -> None:
-        with self._connect() as conn:
-            [conn.execute](https://conn.execute)(
-                """
-                INSERT INTO bot_state (id, data, updated_at) VALUES (1, %s, now())
-                ON CONFLICT (id) DO UPDATE SET data = [EXCLUDED.data](https://EXCLUDED.data), updated_at = now()
-                """,
-                (self._Jsonb(state),),
-            )
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO bot_state (id, data, updated_at) VALUES (1, %s, now())
+                        ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+                        """,
+                        (self._Json(state),),
+                    )
+                conn.commit()
+        except self._psycopg2.Error as exc:
+            raise StateError(f"خطا در ذخیره‌ی وضعیت در PostgreSQL: {exc}") from exc
 
-def build_storage():
+
+def build_storage() -> FileStorage | PostgresStorage:
     if DATABASE_URL:
-        [logger.info](https://logger.info)("وضعیت در PostgreSQL ذخیره می‌شود.")
+        logger.info("وضعیت در PostgreSQL ذخیره می‌شود.")
         return PostgresStorage(DATABASE_URL)
-    [logger.warning](https://logger.warning)(
+    logger.warning(
         "DATABASE_URL تعریف نشده؛ وضعیت در فایل %s ذخیره می‌شود. "
         "روی Heroku این فایل با هر ری‌استارت پاک می‌شود.",
         STATE_FILE,
     )
     return FileStorage(STATE_FILE)
 
+
 _storage: FileStorage | PostgresStorage | None = None
+
+
+def get_storage() -> FileStorage | PostgresStorage:
+    global _storage
+    if _storage is None:
+        _storage = build_storage()
+    return _storage
+
 
 # ─────────────────────────── وضعیت ───────────────────────────
 def default_state() -> dict:
@@ -168,28 +233,65 @@ def default_state() -> dict:
         "trade_history": [],
     }
 
+
 def normalize_state(raw: dict | None) -> dict:
+    """اعتبارسنجی و نرمالایز کردن وضعیت بارگذاری‌شده.
+
+    - اگر raw برابر None باشد، سبد پیش‌فرض ساخته می‌شود.
+    - جفت‌ارزهایی که در holdings نیستند با مقدار 0 اضافه می‌شوند.
+    - اگر برای جفت‌ارز خارج از PAIRS دارایی بیشتر از صفر ثبت شده باشد، StateError بالا می‌آید.
+    - اگر فایل/رکورد خراب باشد، StateError بالا می‌آید (ریست بی‌صدا ممنوع است).
+    """
     if raw is None:
         return default_state()
     if not isinstance(raw, dict):
-        raise ValueError("ساختار وضعیت ذخیره‌شده نامعتبر است.")
+        raise StateError("ساختار وضعیت ذخیره‌شده نامعتبر است (آبجکت JSON نیست).")
+
+    try:
+        btc_cash = float(raw.get("btc_cash", INITIAL_BTC))
+        last_rebalance_ts = int(raw.get("last_rebalance_ts", 0))
+    except (TypeError, ValueError) as exc:
+        raise StateError(f"مقادیر عددی وضعیت نامعتبر هستند: {exc}") from exc
+
+    raw_holdings = raw.get("holdings") or {}
+    if not isinstance(raw_holdings, dict):
+        raise StateError("فیلد holdings در وضعیت ذخیره‌شده نامعتبر است.")
 
     holdings = {p: 0.0 for p in PAIRS}
-    for pair, qty in ([raw.get](https://raw.get)("holdings") or {}).items():
-        holdings[pair] = float(qty)   # دارایی‌های خارج از PAIRS هم حفظ می‌شوند تا فروخته شوند
+    for pair, qty in raw_holdings.items():
+        try:
+            qty_float = float(qty)
+        except (TypeError, ValueError) as exc:
+            raise StateError(f"مقدار دارایی برای {pair} عدد نیست: {exc}") from exc
+        # جفت‌ارز خارج از PAIRS با مقدار مثبت → خطا
+        if pair not in PAIRS and qty_float > 0:
+            raise StateError(
+                f"دارایی مثبت برای جفت‌ارز ناشناخته '{pair}' در وضعیت ثبت شده است. "
+                "امکان ادامه‌ی امن وجود ندارد."
+            )
+        # جفت‌ارزهای داخل PAIRS یا جفت‌ارزهای خارج از PAIRS با مقدار صفر حفظ می‌شوند.
+        holdings[pair] = qty_float
+
+    raw_history = raw.get("trade_history") or []
+    if not isinstance(raw_history, list):
+        raise StateError("فیلد trade_history در وضعیت ذخیره‌شده لیست نیست.")
+    trade_history = list(raw_history)[-MAX_TRADE_HISTORY:]
 
     return {
-        "btc_cash": float([raw.get](https://raw.get)("btc_cash", INITIAL_BTC)),
+        "btc_cash": btc_cash,
         "holdings": holdings,
-        "last_rebalance_ts": int([raw.get](https://raw.get)("last_rebalance_ts", 0)),
-        "trade_history": list([raw.get](https://raw.get)("trade_history") or [])[-MAX_TRADE_HISTORY:],
+        "last_rebalance_ts": last_rebalance_ts,
+        "trade_history": trade_history,
     }
 
+
 def load_state() -> dict:
-    return normalize_state([_storage.load](https://_storage.load)())
+    return normalize_state(get_storage().load())
+
 
 def save_state(state: dict) -> None:
-    [_storage.save](https://_storage.save)(state)
+    get_storage().save(state)
+
 
 def portfolio_value(state: dict, prices: dict) -> tuple[float, list[str]]:
     total = float(state["btc_cash"])
@@ -200,18 +302,20 @@ def portfolio_value(state: dict, prices: dict) -> tuple[float, list[str]]:
         if pair in prices:
             total += qty * prices[pair]
         else:
-            [unknown.append](https://unknown.append)(pair)
+            unknown.append(pair)
     return total, unknown
 
+
 def is_rebalance_due(state: dict, now: int | None = None) -> bool:
-    now = now or int([time.time](https://time.time)())
-    last_ts = [state.get](https://state.get)("last_rebalance_ts", 0)
+    now = now if now is not None else int(time.time())
+    last_ts = state.get("last_rebalance_ts", 0)
     return last_ts == 0 or (now - last_ts) >= REBALANCE_INTERVAL_SECONDS
+
 
 # ─────────────────────────── داده‌ی بازار ───────────────────────────
 def fetch_pair_data(symbol: str) -> tuple[np.ndarray, float]:
-    """
-    خروجی: (قیمت‌های بسته‌شدن آخرین LOOKBACK_HOURS کندلِ بسته‌شده، آخرین قیمت لحظه‌ای)
+    """خروجی: (قیمت‌های بسته‌شدن آخرین LOOKBACK_HOURS کندلِ بسته‌شده، آخرین قیمت لحظه‌ای).
+
     کندل جاری (بسته‌نشده) در محاسبه‌ی امتیاز استفاده نمی‌شود، فقط به‌عنوان قیمت اجرا.
     """
     params = {"symbol": symbol, "interval": "1h", "limit": LOOKBACK_HOURS + 5}
@@ -220,440 +324,470 @@ def fetch_pair_data(symbol: str) -> tuple[np.ndarray, float]:
     for attempt in range(FETCH_RETRIES):
         for url in KLINE_ENDPOINTS:
             try:
-                res = [requests.get](https://requests.get)(url, params=params, timeout=REQUEST_TIMEOUT)
-                [res.raise](https://res.raise)_for_status()
-                data = [res.json](https://res.json)()
+                res = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                res.raise_for_status()
+                data = res.json()
                 if not isinstance(data, list) or not data:
                     raise ValueError(f"پاسخ غیرمنتظره: {str(data)[:120]}")
 
-                now_ms = int([time.time](https://time.time)() * 1000)
+                now_ms = int(time.time() * 1000)
                 closed = [k for k in data if int(k[6]) < now_ms]
                 if len(closed) < LOOKBACK_HOURS:
                     raise ValueError(
                         f"فقط {len(closed)} کندل بسته‌شده موجود است (حداقل {LOOKBACK_HOURS} لازم است)"
                     )
 
-                closes = [np.array](https://np.array)(
+                closes = np.array(
                     [float(k[4]) for k in closed[-LOOKBACK_HOURS:]], dtype=np.float64
                 )
+                # آخرین کندل (احتمالاً باز) فقط برای قیمت لحظه‌ای استفاده می‌شود
                 last_price = float(data[-1][4])
-                if not [np.all](https://np.all)([np.isfinite](https://np.isfinite)(closes)) or [np.any](https://np.any)(closes <= 0) or last_price <= 0:
+                if (
+                    not np.all(np.isfinite(closes))
+                    or np.any(closes <= 0)
+                    or last_price <= 0
+                ):
                     raise ValueError("قیمت نامعتبر در داده‌ها")
                 return closes, last_price
 
-            except ([requests.RequestException](https://requests.RequestException), ValueError, TypeError, IndexError) as exc:
+            except (requests.RequestException, ValueError, TypeError, IndexError) as exc:
                 last_error = exc
-                [logger.warning](https://logger.warning)(
+                logger.warning(
                     "دریافت %s از %s ناموفق بود (تلاش %d/%d): %s",
                     symbol, url, attempt + 1, FETCH_RETRIES, exc,
                 )
 
         if attempt < FETCH_RETRIES - 1:
-            [time.sleep](https://time.sleep)(RETRY_BACKOFF_SECONDS * (2 ** attempt))
+            # backoff: 2s, 4s
+            backoff = RETRY_BACKOFF_SECONDS * (2 ** attempt)
+            time.sleep(backoff)
 
-    raise DataFetchError(f"{symbol}: {last_error}")
-
-def trend_metrics(closes: [np.ndarra](https://np.ndarra)y) -> tuple[float, float, float]:
-    """بازده کل، شیب رگرسیون روی قیمت نرمال‌شده، و R²."""
-    c_old, c_now = float(closes[0]), float(closes[-1])
-    ret = c_now / c_old - 1.0
-
-    y = closes / c_old
-    x = [np.arange](https://np.arange)(len(y), dtype=np.float64)
-    x_diff = x - [x.mean](https://x.mean)()
-    y_diff = y - [y.mean](https://y.mean)()
-
-    x_var = float([np.sum](https://np.sum)(x_diff ** 2))
-    cov = float([np.sum](https://np.sum)(x_diff * y_diff))
-    ss_tot = float([np.sum](https://np.sum)(y_diff ** 2))
-
-    slope = cov / x_var
-    r2 = (cov ** 2) / (x_var * ss_tot) if ss_tot > 0 else 0.0
-    return ret, slope, r2
-
-def zscore(a: [np.ndarra](https://np.ndarra)y) -> [np.ndarray](https://np.ndarray):
-    std = float([np.std](https://np.std)(a))
-    if std == 0 or not [np.isfinite](https://np.isfinite)(std):
-        return [np.zeros](https://np.zeros)_like(a)
-    return (a - [np.mean](https://np.mean)(a)) / std
-
-def compute_scores(pair_data: dict[str, tuple[np.ndarray, float]]) -> dict:
-    pairs = [p for p in PAIRS if p in pair_data]
-    rets, trends, r2s = [], [], []
-
-    for p in pairs:
-        ret, slope, r2 = trend_metrics(pair_data[p][0])
-        [rets.append](https://rets.append)(ret)
-        [trends.append](https://trends.append)(slope * r2)
-        [r2s.append](https://r2s.append)(r2)
-
-    blend = 0.5 * zscore([np.array](https://np.array)(rets)) + 0.5 * zscore([np.array](https://np.array)(trends))
-
-    scores = {}
-    for i, p in enumerate(pairs):
-        if REQUIRE_BOTH_POSITIVE:
-            eligible = rets[i] > 0 and trends[i] > 0
-        else:
-            eligible = rets[i] > 0 or trends[i] > 0
-        scores[p] = {
-            "score": float(blend[i]),
-            "eligible": bool(eligible),
-            "return_pct": float(rets[i] * 100),
-            "trend_score": float(trends[i]),
-            "r2": float(r2s[i]),
-            "price": float(pair_data[p][1]),
-        }
-    return scores
-
-def fetch_and_score() -> tuple[dict, dict, dict]:
-    """دریافت موازی داده‌ی همه‌ی جفت‌ها. خروجی: (scores, prices, failed)"""
-    pair_data: dict[str, tuple[np.ndarray, float]] = {}
-    failed: dict[str, str] = {}
-
-    with ThreadPoolExecutor(max_workers=len(PAIRS)) as pool:
-        futures = {pool.submit(fetch_pair_data, p): p for p in PAIRS}
-        for future in as_completed(futures):
-            pair = futures[future]
-            try:
-                pair_data[pair] = future.result()
-            except Exception as exc:
-                failed[pair] = str(exc)
-                [logger.error](https://logger.error)("داده‌ی %s دریافت نشد: %s", pair, exc)
-
-    if len(pair_data) < 2:
-        raise DataFetchError("داده‌ی کافی برای رتبه‌بندی دریافت نشد (کمتر از ۲ جفت‌ارز).")
-
-    scores = compute_scores(pair_data)
-    prices = {p: s["price"] for p, s in [scores.items](https://scores.items)()}
-    return scores, prices, failed
-
-# ─────────────────────────── ریبالانس ───────────────────────────
-def execute_rebalance(state: dict, scores: dict, prices: dict) -> tuple[dict, list[str], list[str]]:
-    """
-    تابع خالص: وضعیت ورودی را تغییر نمی‌دهد و وضعیت جدید را برمی‌گرداند.
-    ترتیب: ۱) فروش ارزهای خارج از هدف ۲) کاهش وزنِ هدف‌های اضافه‌وزن ۳) خرید.
-    """
-    missing = [p for p, q in state["holdings"].items() if q > 0 and p not in prices]
-    if missing:
-        raise RuntimeError(
-            "قیمت این دارایی‌ها دریافت نشد و ریبالانس لغو شد: " + ", ".join(missing)
-        )
-
-    ranked = sorted(
-        (p for p in scores if scores[p]["eligible"]),
-        key=lambda p: scores[p]["score"],
-        reverse=True,
+    raise MarketDataError(
+        f"دریافت داده‌های بازار برای {symbol} پس از {FETCH_RETRIES} تلاش ناموفق بود: {last_error}"
     )
-    targets = ranked[:TOP_N]
 
-    holdings = {p: float(q) for p, q in state["holdings"].items()}
-    btc_cash = float(state["btc_cash"])
-    total_before, _ = portfolio_value(state, prices)
-    min_trade = total_before * MIN_TRADE_FRACTION
-    target_value = total_before * WEIGHT_PER_ASSET
-    now = int([time.time](https://time.time)())
 
-    trades: list[dict] = []
+# ─────────────────────────── استراتژی ───────────────────────────
+def compute_hybrid_scores() -> tuple[dict, dict]:
+    """محاسبه‌ی امتیاز هیبریدی برای همه‌ی جفت‌ارزها.
+
+    فرمول امتیاز (دقیقاً حفظ شده):
+        ret = (c_now / c_old) - 1
+        slope, r2 = رگرسیون خطی روی y = window / c_old
+        reg_score = slope * r2
+        z_ret = zscore(rets)
+        z_reg = zscore(reg_scores)
+        blend = 0.5 * z_ret + 0.5 * z_reg
+        eligible = (ret > 0) OR (reg_score > 0)
+
+    خروجی:
+        scores[p] = {score, return_10d, trend_score, eligible, price}
+        prices[p] = آخرین قیمت لحظه‌ای
+    """
+    rets = {}
+    reg_scores = {}
+    current_prices = {}
+
+    x = np.arange(LOOKBACK_HOURS, dtype=np.float64)
+    x_diff = x - np.mean(x)
+    x_var = np.sum(x_diff ** 2)
+
+    for p in PAIRS:
+        closes, last_price = fetch_pair_data(p)
+        window = closes[-LOOKBACK_HOURS:]
+        c_now = float(window[-1])
+        c_old = float(window[0])
+        current_prices[p] = last_price  # قیمت لحظه‌ای برای اجرا
+
+        # بازدهی ۱۰ روزه
+        ret = (c_now / c_old) - 1.0
+        rets[p] = ret
+
+        # شیب رگرسیون پیوسته
+        y = window / c_old
+        y_diff = y - np.mean(y)
+        slope = np.sum(x_diff * y_diff) / x_var
+        ss_tot = np.sum(y_diff ** 2)
+        r2 = (float(np.sum(x_diff * y_diff)) ** 2) / (x_var * ss_tot) if ss_tot > 0 else 0.0
+        reg_scores[p] = float(slope * r2)
+
+    r_arr = np.array(list(rets.values()), dtype=np.float64)
+    s_arr = np.array(list(reg_scores.values()), dtype=np.float64)
+
+    r_std = float(np.std(r_arr))
+    s_std = float(np.std(s_arr))
+    z_ret = (r_arr - np.mean(r_arr)) / (r_std + 1e-6)
+    z_reg = (s_arr - np.mean(s_arr)) / (s_std + 1e-6)
+
+    blend = 0.5 * z_ret + 0.5 * z_reg
+    final_scores = {}
+    for idx, p in enumerate(PAIRS):
+        is_eligible = (rets[p] > 0) or (reg_scores[p] > 0)
+        final_scores[p] = {
+            "score": float(blend[idx]),
+            "return_10d": float(rets[p] * 100),
+            "trend_score": float(reg_scores[p]),
+            "eligible": bool(is_eligible),
+            "price": float(current_prices[p]),
+        }
+
+    return final_scores, current_prices
+
+
+def execute_rebalance(
+    state: dict,
+    scores: dict,
+    prices: dict,
+    reason: str = "scheduled",
+) -> tuple[list[str], list[str], float]:
+    """اجرای یک چرخه‌ی ریبالانس روی یک کپی از state.
+
+    مراحل (طبق مشخصات):
+        (الف) فروش کامل ارزهایی که دیگر هدف نیستند.
+        (ب) محاسبه‌ی target_val بر اساس ارزش سبد بعد از فروش‌ها.
+        (ج) کاهش وزن ارزهای بیش‌وزن (کاهش وزن، نه سیو سود).
+        (د) خرید با min(deficit, btc_cash).
+
+    معاملات کوچک‌تر از MIN_TRADE_FRACTION × ارزش سبد انجام نمی‌شوند.
+    btc_cash هیچ‌وقت منفی نمی‌شود.
+    """
+    # کار روی یک کپی از state؛ فقط در صورت موفقیت در خروجی ذخیره می‌شود.
+    new_state = {
+        "btc_cash": float(state.get("btc_cash", INITIAL_BTC)),
+        "holdings": dict(state.get("holdings") or {}),
+        "last_rebalance_ts": int(state.get("last_rebalance_ts", 0)),
+        "trade_history": list(state.get("trade_history") or []),
+    }
+    # اطمینان از وجود همه‌ی PAIRS در holdings
+    for p in PAIRS:
+        new_state["holdings"].setdefault(p, 0.0)
+
+    btc_cash = new_state["btc_cash"]
+    holdings = new_state["holdings"]
+    history = new_state["trade_history"]
     logs: list[str] = []
 
-    def sell(pair: str, qty: float, full: bool) -> None:
-        nonlocal btc_cash
-        price = prices[pair]
-        gross = qty * price
-        fee = gross * FEE
-        net = gross - fee
-        holdings[pair] = 0.0 if full else max(holdings[pair] - qty, 0.0)
-        btc_cash += net
-        [trades.append](https://trades.append)({
-            "ts": now, "side": "SELL", "pair": pair, "qty": qty,
-            "price": price, "btc": net, "fee_btc": fee,
-            "reason": "exit" if full else "trim",
+    # انتخاب هدف‌ها: از بین TOP_N رتبه‌ی اول فقط eligible ها
+    sorted_pairs = sorted(scores.keys(), key=lambda p: scores[p]["score"], reverse=True)
+    targets = [p for p in sorted_pairs[:TOP_N] if scores[p].get("eligible", False)]
+
+    # محاسبه‌ی ارزش فعلی سبد (قبل از هر معامله) برای آستانه‌ی معامله
+    def _portfolio_value_after() -> float:
+        return btc_cash + sum(holdings.get(p, 0.0) * prices[p] for p in PAIRS)
+
+    min_trade_value = MIN_TRADE_FRACTION * _portfolio_value_after()
+
+    def _record(side: str, pair: str, qty: float, price: float, gross_btc_override: float | None = None) -> None:
+        """ثبت یک معامله در trade_history.
+
+        برای buy: gross_btc = مقدار BTC خرج‌شده (spend)، fee_btc = spend * FEE.
+        برای sell/trim: gross_btc = qty * price، fee_btc = gross * FEE.
+        """
+        gross_btc = gross_btc_override if gross_btc_override is not None else qty * price
+        fee_btc = gross_btc * FEE
+        history.append({
+            "ts": int(time.time()),
+            "reason": reason,
+            "side": side,
+            "pair": pair,
+            "qty": float(qty),
+            "price": float(price),
+            "gross_btc": float(gross_btc),
+            "fee_btc": float(fee_btc),
         })
-        label = "🔴 فروش کامل" if full else "🟡 کاهش وزن"
-        [logs.append](https://logs.append)(f"{label} {pair}: {qty:,.4f} واحد ← {net:.6f} BTC")
+        # نگه‌داشتن حداکثر MAX_TRADE_HISTORY رکورد آخر
+        if len(history) > MAX_TRADE_HISTORY:
+            del history[: len(history) - MAX_TRADE_HISTORY]
 
-    # ۱) فروش ارزهایی که دیگر در هدف نیستند
-    for pair, qty in list([holdings.items](https://holdings.items)()):
-        if qty > 0 and pair not in targets:
-            sell(pair, qty, full=True)
+    # (الف) فروش کامل ارزهای غیر هدف
+    for p in PAIRS:
+        qty = holdings.get(p, 0.0)
+        if p not in targets and qty > 0:
+            sold_value = qty * prices[p]
+            if sold_value < min_trade_value:
+                # معامله‌ی کوچک‌تر از آستانه انجام نمی‌شود؛ دارایی حفظ می‌شود
+                logs.append(f"⚪ حفظ {p} (مقدار فروش زیر آستانه)")
+                continue
+            proceeds = sold_value * (1 - FEE)
+            btc_cash += proceeds
+            holdings[p] = 0.0
+            _record("sell", p, qty, prices[p])
+            logs.append(f"🔴 فروش کامل {p} → {proceeds:.6f} BTC")
 
-    # ۲) کاهش وزن هدف‌هایی که بیش از وزن هدف رشد کرده‌اند
-    for pair in targets:
-        excess_value = [holdings.get](https://holdings.get)(pair, 0.0) * prices[pair] - target_value
-        if excess_value > min_trade:
-            qty = min(excess_value / prices[pair], holdings[pair])
-            sell(pair, qty, full=False)
+    # (ب) محاسبه‌ی target_val بر اساس ارزش سبد بعد از فروش‌ها
+    total_val = btc_cash + sum(holdings.get(p, 0.0) * prices[p] for p in PAIRS)
+    target_val = total_val * WEIGHT_PER_ASSET
+    min_trade_value = MIN_TRADE_FRACTION * total_val
 
-    # ۳) خرید تا رسیدن به وزن هدف (در صورت کمبود نقدینگی، خرید جزئی)
-    for pair in targets:
-        deficit = target_value - [holdings.get](https://holdings.get)(pair, 0.0) * prices[pair]
-        if deficit <= min_trade:
+    # (ج) کاهش وزن ارزهای هدف بیش‌وزن (کاهش وزن)
+    for p in targets:
+        curr_val = holdings.get(p, 0.0) * prices[p]
+        excess_val = curr_val - target_val
+        if excess_val > min_trade_value:
+            excess_qty = excess_val / prices[p]
+            excess_qty = min(excess_qty, holdings.get(p, 0.0))
+            if excess_qty <= 0:
+                continue
+            sold_value = excess_qty * prices[p]
+            proceeds = sold_value * (1 - FEE)
+            btc_cash += proceeds
+            holdings[p] = holdings.get(p, 0.0) - excess_qty
+            _record("trim", p, excess_qty, prices[p])
+            logs.append(f"🟡 کاهش وزن {p} → {proceeds:.6f} BTC")
+
+    # (د) خرید با min(deficit, btc_cash)
+    for p in targets:
+        curr_val = holdings.get(p, 0.0) * prices[p]
+        deficit = target_val - curr_val
+        if deficit <= min_trade_value:
             continue
-        spend = min(deficit, btc_cash)
-        if spend <= min_trade:
-            [logs.append](https://logs.append)(f"⚠️ خرید {pair} انجام نشد: نقدینگی کافی نیست.")
+        spend = min(deficit, max(btc_cash, 0.0))
+        if spend <= 0:
             continue
-
-        price = prices[pair]
-        fee = spend * FEE
-        qty = (spend - fee) / price
-        holdings[pair] = holdings.get(pair, 0.0) + qty
+        bought_qty = (spend / prices[p]) * (1 - FEE)
+        holdings[p] = holdings.get(p, 0.0) + bought_qty
         btc_cash -= spend
-        [trades.append](https://trades.append)({
-            "ts": now, "side": "BUY", "pair": pair, "qty": qty,
-            "price": price, "btc": spend, "fee_btc": fee, "reason": "entry",
-        })
-        note = " (خرید جزئی)" if spend < deficit else ""
-        [logs.append](https://logs.append)(f"🟢 خرید {pair}: {spend:.6f} BTC ← {qty:,.4f} واحد{note}")
+        btc_cash = max(btc_cash, 0.0)  # هرگز منفی نشود
+        # برای buy: gross_btc = spend (مقدار خرج‌شده) و fee_btc = spend * FEE
+        _record("buy", p, bought_qty, prices[p], gross_btc_override=spend)
+        logs.append(f"🟢 خرید {p} → {spend:.6f} BTC")
 
-    # حذف دارایی‌های صفرشده‌ای که دیگر جزو PAIRS نیستند
-    for pair in list(holdings):
-        if pair not in PAIRS and holdings[pair] == 0:
-            del holdings[pair]
+    new_state["btc_cash"] = btc_cash
+    new_state["last_rebalance_ts"] = int(time.time())
 
-    new_state = {
-        "btc_cash": btc_cash,
-        "holdings": holdings,
-        "last_rebalance_ts": now,
-        "trade_history": (state["trade_history"] + trades)[-MAX_TRADE_HISTORY:],
-    }
-    return new_state, targets, logs
+    # محاسبه‌ی ارزش نهایی
+    new_total = btc_cash + sum(holdings.get(p, 0.0) * prices[p] for p in PAIRS)
 
-REBALANCE_LOCK = [asyncio.Lock](https://asyncio.Lock)()
+    return targets, logs, new_total, new_state
 
-async def run_rebalance(force: bool):
-    """
-    ریبالانس را زیر قفل اجرا می‌کند تا اجرای دستی و خودکار هم‌زمان نشوند.
-    اگر force=False باشد و سررسید نرسیده باشد، None برمی‌گرداند.
-    """
-    async with REBALANCE_LOCK:
-        state = await [asyncio.to](https://asyncio.to)_thread(load_state)
-        if not force and not is_rebalance_due(state):
-            return None
-
-        scores, prices, failed = await [asyncio.to](https://asyncio.to)_thread(fetch_and_score)
-        new_state, targets, logs = execute_rebalance(state, scores, prices)
-        await [asyncio.to](https://asyncio.to)_thread(save_state, new_state)
-
-        [logger.info](https://logger.info)("ریبالانس انجام شد. اهداف: %s | %d معامله", targets, len(logs))
-        return new_state, scores, prices, failed, targets, logs
-
-# ─────────────────────────── قالب‌بندی پیام‌ها (HTML) ───────────────────────────
-def fmt_ts(ts: int) -> str:
-    if not ts:
-        return "هنوز انجام نشده"
-    return [datetime.fromtimestamp](https://datetime.fromtimestamp)(ts, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
-
-def pct(part: float, total: float) -> float:
-    return (part / total * 100) if total > 0 else 0.0
 
 def format_status_message(
     state: dict,
     scores: dict,
     prices: dict,
-    failed: dict | None = None,
     targets: list[str] | None = None,
     logs: list[str] | None = None,
-    title: str | None = None,
 ) -> str:
-    e = [html.escape](https://html.escape)
-    total, unknown = portfolio_value(state, prices)
-    cash = state["btc_cash"]
-    last_ts = [state.get](https://state.get)("last_rebalance_ts", 0)
-    pnl = (total / INITIAL_BTC - 1) * 100
+    total_val, _unknown = portfolio_value(state, prices)
+    targets = targets or []
 
-    lines: list[str] = []
-    if title:
-        lines += [f"<b>{e(title)}</b>", ""]
+    msg = "📊 <b>گزارش وضعیت استراتژی هیبریدی ۱۰ روزه</b>\n\n"
+    msg += f"💰 <b>ارزش کل پورتفو:</b> <code>{total_val:.4f} BTC</code>\n"
+    cash_pct = (state["btc_cash"] / total_val * 100) if total_val > 0 else 0.0
+    msg += f"💵 <b>موجودی نقد بیت‌کوین:</b> <code>{state['btc_cash']:.4f} BTC</code> ({cash_pct:.1f}%)\n"
 
-    [lines.append](https://lines.append)("📊 <b>گزارش وضعیت استراتژی مومنتوم ۱۰ روزه</b>")
-    [lines.append](https://lines.append)("")
-    [lines.append](https://lines.append)(f"💰 <b>ارزش کل پورتفو:</b> <code>{total:.6f} BTC</code> ({pnl:+.2f}% از شروع)")
-    if unknown:
-        [lines.append](https://lines.append)(f"⚠️ قیمت {e(', '.join(unknown))} دریافت نشد؛ ارزش کل ناقص است.")
-    [lines.append](https://lines.append)(f"💵 <b>بیت‌کوین نقد:</b> <code>{cash:.6f} BTC</code> ({pct(cash, total):.1f}%)")
-    [lines.append](https://lines.append)(f"🕒 <b>آخرین ریبالانس:</b> {fmt_ts(last_ts)}")
-    if last_ts:
-        [lines.append](https://lines.append)(f"⏭ <b>ریبالانس خودکار بعدی:</b> {fmt_ts(last_ts + REBALANCE_INTERVAL_SECONDS)}")
+    # زمان آخرین ریبالانس و ریبالانس بعدی به وقت BOT_TIMEZONE
+    last_ts = state.get("last_rebalance_ts", 0)
+    if last_ts > 0:
+        last_dt = datetime.fromtimestamp(last_ts, tz=BOT_TIMEZONE)
+        msg += f"🕒 <b>آخرین ریبالانس:</b> {html.escape(last_dt.strftime('%Y-%m-%d %H:%M %Z'))}\n"
+        next_ts = last_ts + REBALANCE_INTERVAL_SECONDS
+        next_dt = datetime.fromtimestamp(next_ts, tz=BOT_TIMEZONE)
+        msg += f"🕒 <b>ریبالانس بعدی:</b> {html.escape(next_dt.strftime('%Y-%m-%d %H:%M %Z'))}\n"
+    else:
+        msg += "🕒 <b>آخرین ریبالانس:</b> هنوز انجام نشده (ریبالانس اولیه سررسید است)\n"
 
-    lines += ["", "📈 <b>سبد آلت‌کوین‌ها:</b>"]
-    held = [(p, q) for p, q in state["holdings"].items() if q > 0]
-    if not held:
-        [lines.append](https://lines.append)("▫️ <i>تمام سبد در حال حاضر بیت‌کوین نقد است.</i>")
-    for pair, qty in held:
-        if pair in prices:
-            val = qty * prices[pair]
-            [lines.append](https://lines.append)(
-                f"▫️ <code>{e(pair)}</code>: {qty:,.4f} واحد "
-                f"(<code>{val:.6f} BTC</code> | {pct(val, total):.1f}%)"
-            )
-        else:
-            [lines.append](https://lines.append)(f"▫️ <code>{e(pair)}</code>: {qty:,.4f} واحد (قیمت نامشخص)")
+    msg += "\n📈 <b>سبد آلت‌کوین‌ها:</b>\n"
+    has_alts = False
+    for p in PAIRS:
+        amt = state["holdings"].get(p, 0.0)
+        if amt > 0:
+            has_alts = True
+            val = amt * prices[p]
+            pct = (val / total_val * 100) if total_val > 0 else 0.0
+            msg += f"▫️ <code>{html.escape(p)}</code>: {amt:.4f} واحد (<code>{val:.4f} BTC</code> | {pct:.1f}%)\n"
+    if not has_alts:
+        msg += "▫️ تمام سبد در حال حاضر بیت‌کوین نقد است.\n"
 
-    lines += ["", "🔍 <b>رتبه‌بندی ۱۰ روز اخیر:</b>"]
-    target_set = set(targets or [])
-    ranked = sorted(
-        scores, key=lambda p: (scores[p]["eligible"], scores[p]["score"]), reverse=True
-    )
-    for pair in ranked:
-        sc = scores[pair]
-        icon = "✅" if pair in target_set else ("▫️" if sc["eligible"] else "⛔️")
-        score_txt = f"{sc['score']:+.2f}" if sc["eligible"] else "—"
-        [lines.append](https://lines.append)(
-            f"{icon} <code>{e(pair):<8}</code> | بازده: <code>{sc['return_pct']:+.2f}%</code>"
-            f" | R²: <code>{sc['r2']:.2f}</code> | امتیاز: <code>{score_txt}</code>"
+    msg += "\n🔍 <b>رتبه‌بندی ۱۰ روز اخیر:</b>\n"
+    sorted_p = sorted(scores.keys(), key=lambda x: scores[x]["score"], reverse=True)
+    for p in sorted_p:
+        sc = scores[p]
+        status = "✅" if p in targets else "▫️"
+        eligible_marker = "" if sc.get("eligible") else " (غیرواجد)"
+        msg += (
+            f"{status} <code>{html.escape(p):&lt;7}</code> | "
+            f"بازدهی: <code>{sc['return_10d']:>+5.1f}%</code> | "
+            f"امتیاز: <code>{sc['score']:>+4.2f}</code>{eligible_marker}\n"
         )
 
-    if failed:
-        lines += ["", f"⚠️ <b>دریافت داده ناموفق:</b> {e(', '.join(sorted(failed)))}"]
+    if logs:
+        msg += "\n📝 <b>تراکنش‌های ریبالانس:</b>\n" + "\n".join(logs)
 
-    if logs is not None:
-        lines += ["", "📝 <b>تراکنش‌های ریبالانس:</b>"]
-        lines += [e(line) for line in logs] if logs else ["بدون معامله؛ سبد در وزن هدف بود."]
+    return msg
 
-    return "\n".join(lines)
-
-def format_history(trades: list[dict]) -> str:
-    if not trades:
-        return "هنوز معامله‌ای ثبت نشده است."
-    lines = [f"🧾 <b>آخرین {len(trades)} معامله:</b>", ""]
-    for t in reversed(trades):
-        side = "🟢 خرید" if t["side"] == "BUY" else "🔴 فروش"
-        [lines.append](https://lines.append)(
-            f"{fmt_ts(t['ts'])} | {side} <code>{html.escape(t['pair'])}</code> | "
-            f"{t['qty']:,.4f} @ {t['price']:.8f} | <code>{t['btc']:.6f} BTC</code>"
-        )
-    return "\n".join(lines)
 
 # ─────────────────────────── دستورات تلگرام ───────────────────────────
-async def start_command(update: Update, context: [ContextTypes.DEFAULT](https://ContextTypes.DEFAULT)_TYPE):
-    await [update.effective_message.reply](https://update.effective_message.reply)_text(
-        "ربات معامله‌گر مومنتوم ۱۰ روزه فعال است (حالت شبیه‌سازی).\n\n"
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "ربات معامله‌گر هیبریدی ۱۰ روزه فعال است.\n\n"
         "دستورات:\n"
-        "/status - وضعیت فعلی پورتفو و رتبه‌بندی ارزها\n"
-        "/rebalance - اجرای دستی ریبالانس (تایمر ۱۰ روزه را از نو شروع می‌کند)\n"
-        "/history - آخرین معاملات"
+        "/status - نمایش وضعیت فعلی پورتفو و رتبه‌بندی ارزها\n"
+        "/rebalance - اجرای دستی چرخه ریبالانس همین لحظه\n"
+        "/history - نمایش ۱۰ معامله‌ی آخر"
     )
 
-async def status_command(update: Update, context: [ContextTypes.DEFAULT](https://ContextTypes.DEFAULT)_TYPE):
-    message = [update.effective](https://update.effective)_message
-    await [message.reply](https://message.reply)_text("⏳ در حال دریافت داده‌های بازار و محاسبه‌ی امتیازها...")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("در حال دریافت داده‌های بازار و محاسبه Z-Score...")
     try:
-        state = await [asyncio.to](https://asyncio.to)_thread(load_state)
-        scores, prices, failed = await [asyncio.to](https://asyncio.to)_thread(fetch_and_score)
+        state = await asyncio.to_thread(load_state)
+        scores, prices = await asyncio.to_thread(compute_hybrid_scores)
+        msg = format_status_message(state, scores, prices)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
     except Exception as exc:
-        [logger.exception](https://logger.exception)("خطا در /status")
-        await [message.reply](https://message.reply)_text(f"❌ خطا در دریافت وضعیت: {exc}")
+        logger.exception("خطا در /status")
+        await update.message.reply_text(f"خطا در پردازش: {html.escape(str(exc))}")
+
+
+async def manual_rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # قفل ریبالانس: اگر در حال اجراست، پیام بده
+    lock: asyncio.Lock | None = context.application.bot_data.get("rebalance_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        context.application.bot_data["rebalance_lock"] = lock
+    if lock.locked():
+        await update.message.reply_text("⛔ ریبالانس دیگری در حال اجراست. لطفاً چند لحظه بعد تلاش کنید.")
         return
 
-    await [message.reply](https://message.reply)_text(
-        format_status_message(state, scores, prices, failed=failed),
-        parse_mode=ParseMode.HTML,
-    )
+    async with lock:
+        await update.message.reply_text("در حال اجرای ریبالانس...")
+        try:
+            state = await asyncio.to_thread(load_state)
+            scores, prices = await asyncio.to_thread(compute_hybrid_scores)
+            targets, logs, _new_total, new_state = await asyncio.to_thread(
+                execute_rebalance, state, scores, prices, "manual"
+            )
+            # ذخیره‌ی فقط در صورت موفقیت
+            await asyncio.to_thread(save_state, new_state)
+            msg = format_status_message(new_state, scores, prices, targets=targets, logs=logs)
+            await update.message.reply_text(
+                f"⚡ <b>ریبالانس دستی اجرا شد:</b>\n\n{msg}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.exception("خطا در /rebalance")
+            await update.message.reply_text(f"خطا در ریبالانس: {html.escape(str(exc))}")
 
-async def rebalance_command(update: Update, context: [ContextTypes.DEFAULT](https://ContextTypes.DEFAULT)_TYPE):
-    message = [update.effective](https://update.effective)_message
-    await [message.reply](https://message.reply)_text("⏳ در حال اجرای ریبالانس...")
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        new_state, scores, prices, failed, targets, logs = await run_rebalance(force=True)
+        state = await asyncio.to_thread(load_state)
+        history = state.get("trade_history") or []
+        if not history:
+            await update.message.reply_text("📭 هنوز هیچ معامله‌ای ثبت نشده است.")
+            return
+        last = history[-HISTORY_SHOW:]
+        last.reverse()  # آخرین معامله اول نمایش داده شود
+        lines = ["📜 <b>۱۰ معامله‌ی آخر:</b>\n"]
+        for i, t in enumerate(last, start=1):
+            ts = t.get("ts", 0)
+            dt = datetime.fromtimestamp(ts, tz=BOT_TIMEZONE) if ts else None
+            ts_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
+            side = t.get("side", "?")
+            pair = html.escape(str(t.get("pair", "?")))
+            qty = float(t.get("qty", 0.0))
+            price = float(t.get("price", 0.0))
+            gross = float(t.get("gross_btc", 0.0))
+            fee = float(t.get("fee_btc", 0.0))
+            reason = html.escape(str(t.get("reason", "?")))
+            side_emoji = {"buy": "🟢", "sell": "🔴", "trim": "🟡"}.get(side, "⚪")
+            lines.append(
+                f"{i}. {side_emoji} <code>{pair}</code> | {side} | {qty:.6f} @ {price:.8f} BTC"
+                f" | gross={gross:.6f} BTC | fee={fee:.6f} BTC | {reason} | {ts_str}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as exc:
-        [logger.exception](https://logger.exception)("خطا در /rebalance")
-        await [message.reply](https://message.reply)_text(f"❌ ریبالانس انجام نشد و وضعیت تغییری نکرد: {exc}")
+        logger.exception("خطا در /history")
+        await update.message.reply_text(f"خطا در نمایش تاریخچه: {html.escape(str(exc))}")
+
+
+# تابع بازبینی خودکار متصل به JobQueue استاندارد تلگرام
+async def check_scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    lock: asyncio.Lock | None = context.application.bot_data.get("rebalance_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        context.application.bot_data["rebalance_lock"] = lock
+    if lock.locked():
+        logger.info("ریبالانس خودکار به‌خاطر قفل رد شد (ریبالانس دیگری در حال اجراست).")
         return
 
-    await [message.reply](https://message.reply)_text(
-        format_status_message(
-            new_state, scores, prices, failed=failed, targets=targets, logs=logs,
-            title="⚡ ریبالانس دستی اجرا شد",
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-
-async def history_command(update: Update, context: [ContextTypes.DEFAULT](https://ContextTypes.DEFAULT)_TYPE):
-    message = [update.effective](https://update.effective)_message
-    try:
-        state = await [asyncio.to](https://asyncio.to)_thread(load_state)
-    except Exception as exc:
-        [logger.exception](https://logger.exception)("خطا در /history")
-        await [message.reply](https://message.reply)_text(f"❌ خطا در خواندن وضعیت: {exc}")
-        return
-
-    await [message.reply](https://message.reply)_text(
-        format_history(state["trade_history"][-HISTORY_SHOW:]),
-        parse_mode=ParseMode.HTML,
-    )
-
-# ─────────────────────────── زمان‌بند خودکار ───────────────────────────
-async def scheduled_check(context: [ContextTypes.DEFAULT](https://ContextTypes.DEFAULT)_TYPE):
-    chat_id = [context.job.chat](https://context.job.chat)_id
-    try:
-        result = await run_rebalance(force=False)
-    except Exception as exc:
-        [logger.exception](https://logger.exception)("ریبالانس خودکار ناموفق بود")
-        # فقط در اولین خطای پیاپی اطلاع بده تا هر ساعت پیام تکراری نیاید
-        if not [context.bot_data.get](https://context.bot_data.get)("scheduler_error_notified"):
-            [context.bot](https://context.bot)_data["scheduler_error_notified"] = True
-            with [contextlib.suppress](https://contextlib.suppress)(Exception):
-                await [context.bot.send](https://context.bot.send)_message(
-                    chat_id=chat_id,
-                    text=f"⚠️ ریبالانس خودکار ناموفق بود و هر ساعت دوباره تلاش می‌شود:\n{exc}",
+    async with lock:
+        try:
+            state = await asyncio.to_thread(load_state)
+            # بررسی سررسید داخل قفل
+            if not is_rebalance_due(state):
+                return
+            logger.info("سررسید ریبالانس فرا رسید. شروع ریبالانس خودکار...")
+            scores, prices = await asyncio.to_thread(compute_hybrid_scores)
+            targets, logs, _new_total, new_state = await asyncio.to_thread(
+                execute_rebalance, state, scores, prices, "scheduled"
+            )
+            await asyncio.to_thread(save_state, new_state)
+            msg = format_status_message(new_state, scores, prices, targets=targets, logs=logs)
+            if ALLOWED_CHAT_ID is not None:
+                await context.bot.send_message(
+                    chat_id=ALLOWED_CHAT_ID,
+                    text=f"🚨 <b>اجرای سررسید دوره ۱۰ روزه (ریبالانس خودکار)</b>\n\n{msg}",
+                    parse_mode=ParseMode.HTML,
                 )
-        return
+        except Exception as exc:
+            logger.exception("خطا در جاب دوره‌ای")
 
-    [context.bot](https://context.bot)_data["scheduler_error_notified"] = False
-    if result is None:
-        return
 
-    new_state, scores, prices, failed, targets, logs = result
-    await [context.bot.send](https://context.bot.send)_message(
-        chat_id=chat_id,
-        text=format_status_message(
-            new_state, scores, prices, failed=failed, targets=targets, logs=logs,
-            title="🚨 ریبالانس خودکار سررسید ۱۰ روزه",
-        ),
-        parse_mode=ParseMode.HTML,
-    )
+async def post_init(app) -> None:
+    """ساخت قفل ریبالانس پس از مقداردهی اولیه‌ی Application."""
+    app.bot_data.setdefault("rebalance_lock", asyncio.Lock())
 
-async def error_handler(update: object, context: [ContextTypes.DEFAULT](https://ContextTypes.DEFAULT)_TYPE):
-    [logger.error](https://logger.error)("خطای پیش‌بینی‌نشده", exc_info=context.error)
 
-# ─────────────────────────── اجرا ───────────────────────────
-def main():
-    global _storage
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """هندلر سراسری خطا برای جلوگیری از کرش ربات."""
+    logger.error("خطای پیش‌بینی‌نشده در ربات: %s", context.error, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ خطایی در پردازش درخواست رخ داد. لطفاً دوباره تلاش کنید.",
+            )
 
+
+def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("متغیر TELEGRAM_BOT_TOKEN تعریف نشده است.")
-    if not TELEGRAM_CHAT_ID:
-        raise SystemExit("متغیر TELEGRAM_CHAT_ID تعریف نشده است (برای کنترل دسترسی الزامی است).")
-    try:
-        chat_id = int(TELEGRAM_CHAT_ID)
-    except ValueError:
-        raise SystemExit("TELEGRAM_CHAT_ID باید یک عدد باشد.")
+        raise SystemExit("متغیر TELEGRAM_BOT_TOKEN تعریف نشده است. اجرای ربات متوقف می‌شود.")
+    if ALLOWED_CHAT_ID is None:
+        raise SystemExit(
+            "متغیر TELEGRAM_CHAT_ID تعریف نشده یا عدد نیست. اجرای ربات متوقف می‌شود."
+        )
 
-    _storage = build_storage()
-
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    if [app.job](https://app.job)_queue is None:
-        raise SystemExit("JobQueue فعال نیست. نصب کن: pip install 'python-telegram-bot[job-queue]'")
-
-    # فقط چت مجاز می‌تواند دستورات را اجرا کند؛ پیام بقیه نادیده گرفته می‌شود
-    allowed = [filters.Chat](https://filters.Chat)(chat_id=chat_id)
-    [app.add](https://app.add)_handler(CommandHandler(["start", "help"], start_command, filters=allowed))
-    [app.add](https://app.add)_handler(CommandHandler("status", status_command, filters=allowed))
-    [app.add](https://app.add)_handler(CommandHandler("rebalance", rebalance_command, filters=allowed))
-    [app.add](https://app.add)_handler(CommandHandler("history", history_command, filters=allowed))
-    [app.add](https://app.add)_error_handler(error_handler)
-
-    [app.job_queue.run](https://app.job_queue.run)_repeating(
-        scheduled_check,
-        interval=CHECK_INTERVAL_SECONDS,
-        first=30,
-        chat_id=chat_id,
-        name="rebalance-check",
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
 
-    [logger.info](https://logger.info)("ربات آماده‌ی دریافت دستورات است.")
-    [app.run](https://app.run)_polling(drop_pending_updates=True)
+    chat_filter = filters.Chat(chat_id=ALLOWED_CHAT_ID)
+    app.add_handler(CommandHandler("start", start_command, filters=chat_filter))
+    app.add_handler(CommandHandler("status", status_command, filters=chat_filter))
+    app.add_handler(CommandHandler("rebalance", manual_rebalance_command, filters=chat_filter))
+    app.add_handler(CommandHandler("history", history_command, filters=chat_filter))
+
+    app.add_error_handler(global_error_handler)
+
+    # زمان‌بندی با JobQueue استاندارد تلگرام؛ بدون حلقه‌ی while یا create_task
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            check_scheduler_job,
+            interval=CHECK_INTERVAL_SECONDS,
+            first=10,
+        )
+        logger.info("JobQueue زمان‌بندی شد (هر %d ثانیه بررسی سررسید).", CHECK_INTERVAL_SECONDS)
+    else:
+        logger.warning("JobQueue در دسترس نیست؛ ریبالانس خودکار غیرفعال می‌شود.")
+
+    logger.info("ربات با موفقیت استارت خورد.")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
